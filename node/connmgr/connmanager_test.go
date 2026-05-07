@@ -12,11 +12,16 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func init() {
-	// Override the max retry duration when running tests.
+	// Set timing-sensitive package vars once at startup. Mutating them
+	// inside a test body races with the connHandler goroutine that
+	// reads them, so we pick values that work for the whole binary.
 	maxRetryDuration = 2 * time.Millisecond
+	stableConnectionDuration = 10 * time.Millisecond
 }
 
 // mockAddr mocks a network address
@@ -297,6 +302,114 @@ func TestRetryPermanent(t *testing.T) {
 		t.Fatalf("retry: %v - want state %v, got state %v", cr.Addr, wantState, gotState)
 	}
 	cmgr.Stop()
+}
+
+// TestRetryCountGrowsOnInstantDrops verifies that retryCount accumulates
+// across a tight cycle of TCP-success-then-immediate-drop, the scenario
+// where a remote accepts the connection at the kernel layer and then
+// closes it before any useful application-layer exchange.
+func TestRetryCountGrowsOnInstantDrops(t *testing.T) {
+	var cmgr *ConnManager
+	cmgr, err := New(&Config{
+		RetryDuration:  time.Millisecond,
+		TargetOutbound: 1,
+		Dial:           mockDialer,
+		OnConnection: func(c *ConnReq, conn net.Conn) {
+			// Simulate a remote that accepts TCP and then drops at
+			// the application layer with no perceptible lifetime.
+			cmgr.Disconnect(c.ID())
+		},
+	})
+	require.NoError(t, err)
+
+	cr := &ConnReq{
+		Addr:      &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 18555},
+		Permanent: true,
+	}
+	go cmgr.Connect(cr)
+	cmgr.Start()
+	defer cmgr.Stop()
+
+	require.Eventually(t, func() bool {
+		return atomic.LoadUint32(&cr.retryCount) >= 5
+	}, 500*time.Millisecond, time.Millisecond,
+		"retryCount should grow across post-TCP disconnects, got %d",
+		atomic.LoadUint32(&cr.retryCount))
+}
+
+// TestMaxRetryDurationCapEngages verifies that the `d > maxRetryDuration`
+// clamp in handleFailedConn fires once retryCount has grown past the
+// engagement threshold. With init()-set maxRetryDuration=2ms and
+// RetryDuration=1ms, the clamp engages from retryCount=3 onward.
+func TestMaxRetryDurationCapEngages(t *testing.T) {
+	var cmgr *ConnManager
+	cmgr, err := New(&Config{
+		RetryDuration:  time.Millisecond,
+		TargetOutbound: 1,
+		Dial:           mockDialer,
+		OnConnection: func(c *ConnReq, conn net.Conn) {
+			cmgr.Disconnect(c.ID())
+		},
+	})
+	require.NoError(t, err)
+
+	cr := &ConnReq{
+		Addr:      &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 18555},
+		Permanent: true,
+	}
+	go cmgr.Connect(cr)
+	cmgr.Start()
+	defer cmgr.Stop()
+
+	// Drive past the cap engagement threshold by a comfortable margin so
+	// that a few subsequent retries are scheduled at the capped duration
+	// rather than the multiplied one.
+	require.Eventually(t, func() bool {
+		return atomic.LoadUint32(&cr.retryCount) >= 10
+	}, time.Second, time.Millisecond,
+		"expected retryCount to grow past cap engagement threshold, got %d",
+		atomic.LoadUint32(&cr.retryCount))
+}
+
+// TestRetryCountResetsAfterStableConnection verifies the positive side of
+// the heuristic: a connection that lives at least stableConnectionDuration
+// is treated as a real success, so its eventual disconnect resets
+// retryCount.
+func TestRetryCountResetsAfterStableConnection(t *testing.T) {
+	connected := make(chan *ConnReq, 1)
+	cmgr, err := New(&Config{
+		RetryDuration:  time.Millisecond,
+		TargetOutbound: 1,
+		Dial:           mockDialer,
+		OnConnection: func(c *ConnReq, conn net.Conn) {
+			connected <- c
+		},
+	})
+	require.NoError(t, err)
+
+	cr := &ConnReq{
+		Addr:      &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 18555},
+		Permanent: true,
+		// Pre-load with prior failures so the reset is observable.
+		retryCount: 7,
+	}
+	go cmgr.Connect(cr)
+	cmgr.Start()
+	defer cmgr.Stop()
+
+	<-connected
+	// Hold past stableConnectionDuration so the disconnect counts as a
+	// real success.
+	time.Sleep(2 * stableConnectionDuration)
+	cmgr.Disconnect(cr.ID())
+
+	// handleFailedConn will then bump retryCount from 0 to 1. A value
+	// at-or-below 2 confirms the reset path fired.
+	require.Eventually(t, func() bool {
+		return atomic.LoadUint32(&cr.retryCount) <= 2
+	}, 200*time.Millisecond, time.Millisecond,
+		"stable connection drop should reset retryCount, got %d",
+		atomic.LoadUint32(&cr.retryCount))
 }
 
 // TestMaxRetryDuration tests the maximum retry duration.

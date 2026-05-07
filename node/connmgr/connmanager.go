@@ -32,6 +32,15 @@ var (
 	// persistent connections.
 	defaultRetryDuration = time.Second * 5
 
+	// stableConnectionDuration is the minimum lifetime a connection must
+	// reach before its eventual disconnect resets the permanent-peer
+	// retry counter. TCP connect succeeds at the kernel layer well before
+	// the application can decide whether to keep the peer; without this
+	// floor a remote that closes immediately after accept (e.g. it is at
+	// peer capacity) would silently zero the backoff and pin retries at
+	// the base interval forever.
+	stableConnectionDuration = time.Second * 30
+
 	// defaultTargetOutbound is the default number of outbound connections to
 	// maintain.
 	defaultTargetOutbound = uint32(8)
@@ -61,9 +70,19 @@ type ConnReq struct {
 	Addr      net.Addr
 	Permanent bool
 
-	conn       net.Conn
-	state      ConnState
-	stateMtx   sync.RWMutex
+	conn     net.Conn
+	state    ConnState
+	stateMtx sync.RWMutex
+
+	// establishedAt records when the connection most recently entered
+	// ConnEstablished. handleDisconnected uses it (against
+	// stableConnectionDuration) to decide whether to reset retryCount on
+	// drop. Mutated only on connHandler's goroutine.
+	establishedAt time.Time
+
+	// retryCount tracks consecutive failed reconnect attempts and drives
+	// the backoff in handleFailedConn. Writes happen on connHandler;
+	// reads from other goroutines must use atomic loads.
 	retryCount uint32
 }
 
@@ -212,8 +231,8 @@ func (cm *ConnManager) handleFailedConn(c *ConnReq, triggerReconnect bool) {
 		return
 	}
 	if c.Permanent || triggerReconnect {
-		c.retryCount++
-		d := time.Duration(c.retryCount) * cm.cfg.RetryDuration
+		retryCount := atomic.AddUint32(&c.retryCount, 1)
+		d := time.Duration(retryCount) * cm.cfg.RetryDuration
 		if d > maxRetryDuration {
 			d = maxRetryDuration
 		}
@@ -284,9 +303,13 @@ out:
 
 				connReq.updateState(ConnEstablished)
 				connReq.conn = msg.conn
+				connReq.establishedAt = time.Now()
 				conns[connReq.id] = connReq
 				log.Debugf("Connected to %v", connReq)
-				connReq.retryCount = 0
+				// retryCount is reset in handleDisconnected,
+				// gated on stableConnectionDuration, so a TCP
+				// success that the application immediately
+				// drops does not zero the backoff.
 				cm.failedAttempts = 0
 
 				delete(pending, connReq.id)
@@ -320,6 +343,15 @@ out:
 				// callback.
 				log.Debugf("Disconnected from %v", connReq)
 				delete(conns, msg.id)
+
+				// Treat the connection as a real success only
+				// if it lasted at least stableConnectionDuration;
+				// briefer drops keep retryCount intact so
+				// backoff continues to grow.
+				if !connReq.establishedAt.IsZero() &&
+					time.Since(connReq.establishedAt) >= stableConnectionDuration {
+					atomic.StoreUint32(&connReq.retryCount, 0)
+				}
 
 				if connReq.conn != nil {
 					connReq.conn.Close()
