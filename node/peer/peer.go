@@ -936,15 +936,9 @@ func (p *Peer) PushGetBlocksMsg(locator blockchain.BlockLocator, stopHash *chain
 	return nil
 }
 
-// PushGetHeadersMsg sends a getheaders message for the provided block
-// locator and stop hash. It will ignore back-to-back duplicate requests.
-// When includeCerts is true the peer is asked to include block
-// certificates in the response; when false only bare headers are
-// returned. The cert-less form is used by netsync's inv-driven
-// low-quality peer probe, where we only need the bare header chain to
-// decide whether the announced block is worth a follow-up getdata.
-//
-// This function is safe for concurrent access.
+// PushGetHeadersMsg sends a getheaders for the given locator and stop
+// hash, requesting certificates iff includeCerts. Back-to-back duplicate
+// (begin, stop) pairs are filtered. Safe for concurrent access.
 func (p *Peer) PushGetHeadersMsg(locator blockchain.BlockLocator, stopHash *chainhash.Hash, includeCerts bool) error {
 	// Extract the begin hash from the block locator, if one was specified,
 	// to use for filtering duplicate getheaders requests.

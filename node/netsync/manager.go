@@ -52,12 +52,8 @@ const (
 	// is excluded from re-selection.
 	syncPeerCooldown = 10 * time.Minute
 
-	// lowQualityStrikeLimit is the number of accepted-but-not-tip blocks
-	// from a peer that is tolerated before the peer is treated as
-	// low-quality again. New peers start with strikes == limit (untrusted
-	// until proven). A block that becomes the new chain tip clears the
-	// strike count to 0. Each subsequent accepted-but-not-tip block adds
-	// one strike; once strikes >= limit the peer is back to low-quality.
+	// lowQualityStrikeLimit is the strike count at which a peer is
+	// downgraded back to low-quality (see nonTipStrikes).
 	lowQualityStrikeLimit = 5
 )
 
@@ -165,18 +161,14 @@ type peerSyncState struct {
 	requestedTxns   map[chainhash.Hash]struct{}
 	requestedBlocks map[chainhash.Hash]struct{}
 
-	// nonTipStrikes tracks how stale this peer's recent block
-	// announcements are. Starts at lowQualityStrikeLimit (untrusted),
-	// resets to 0 on a tip-extending block, and increments on each
-	// accepted-but-not-tip block. While strikes < limit the peer is
-	// "high quality" and inv messages get a direct getdata; otherwise
-	// they go through getheaders first.
+	// nonTipStrikes counts consecutive non-tip-extending blocks from
+	// this peer. Starts at lowQualityStrikeLimit; resets to 0 on a
+	// tip-extending block; saturates on each accepted-but-not-tip one.
 	nonTipStrikes int
 }
 
-// isPeerHighQuality reports whether the peer has supplied enough near-tip
-// announcements to bypass the inv -> getheaders -> getdata round trip and
-// be trusted with direct block requests on inv announcements.
+// isPeerHighQuality reports whether the peer should bypass the
+// inv -> getheaders -> getdata gate.
 func isPeerHighQuality(state *peerSyncState) bool {
 	return state.nonTipStrikes < lowQualityStrikeLimit
 }
@@ -976,10 +968,8 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	}
 }
 
-// handleHeadersMsg handles block header messages from all peers. Headers are
-// requested either as part of headers-first checkpoint sync, or as the
-// inv -> getheaders -> getdata round trip used for low-quality peers
-// (handleInvMsg gating).
+// handleHeadersMsg handles a headers message: either headers-first
+// checkpoint sync, or the low-quality inv -> getheaders -> getdata path.
 func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	peer := hmsg.peer
 	state, exists := sm.peerStates[peer]
@@ -996,16 +986,13 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	// Outside headers-first mode, this is either an inv-driven response
-	// from a low-quality peer or a BIP130 sendheaders tip announcement.
-	// Verify the first header builds on a block we know (basic anti-spam
-	// check), then request the corresponding blocks via getdata.
+	// Non-headers-first: BIP130 announce or low-quality inv response.
 	if !sm.headersFirstMode {
 		firstPrev := &msg.Headers[0].BlockHeader.PrevBlock
-		haveParent, err := sm.chain.HaveBlock(firstPrev)
-		if err == nil && haveParent {
-			sm.requestBlocksFromHeaders(peer, state, msg.Headers)
+		if have, err := sm.chain.HaveBlock(firstPrev); err != nil || !have {
+			return
 		}
+		sm.requestBlocksFromHeaders(peer, state, msg.Headers)
 		return
 	}
 
@@ -1225,9 +1212,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 	// Finally, attempt to detect potential stalls due to long side chains
 	// we already have and request more blocks to prevent them.
 	//
-	// sentGetHeaders ensures we emit at most one inv-driven getheaders
-	// per inv message, regardless of how many low-quality block invs are
-	// present. The single locator covers all of them.
+	// sentGetHeaders caps the inv-driven probe at one getheaders per batch.
 	sentGetHeaders := false
 	for i, iv := range invVects {
 		// Ignore unsupported inventory types.
@@ -1266,16 +1251,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 				}
 			}
 
-			// For unknown blocks announced by a peer that has not
-			// established near-tip quality, request headers first
-			// (without certificates). The headers response is
-			// validated and then converted into a getdata for the
-			// corresponding blocks; this extra round trip avoids
-			// fetching potentially bogus blocks straight from
-			// low-quality peers. Repeated invs from the same peer
-			// in a single message produce at most one getheaders;
-			// PushGetHeadersMsg further coalesces consecutive
-			// requests with the same (locator, stopHash).
+			// Low-quality peer: probe with cert-less getheaders first;
+			// requestBlocksFromHeaders converts a valid response into
+			// getdata. At most one probe per inv batch.
 			if iv.Type == wire.InvTypeBlock && sm.current() &&
 				!isPeerHighQuality(state) {
 
@@ -1803,19 +1781,10 @@ func New(config *Config) (*SyncManager, error) {
 	return &sm, nil
 }
 
-// requestBlocksFromHeaders extracts block hashes from a HEADERS batch
-// received in non-headers-first mode and emits a getdata for the ones we
-// don't already have or have already requested. Used to complete the
-// inv -> getheaders -> getdata round trip for low-quality peers (and any
-// BIP130 sendheaders announcements). Headers are not added to any
-// persistent header-only index; the chain entry is created when each full
-// block arrives via handleBlockMsg.
-//
-// The caller is responsible for verifying that headers[0].PrevBlock is a
-// block we know. From there this function walks the batch and only
-// requests blocks for headers that form an unbroken parent chain rooted
-// at that known parent; it stops at the first break, so a peer can't
-// smuggle in unconnected garbage by prepending one valid-parent header.
+// requestBlocksFromHeaders emits getdata for headers in the batch that
+// form an unbroken parent chain rooted at headers[0].PrevBlock, stopping
+// at the first link break. Caller must verify headers[0].PrevBlock is a
+// block we already have.
 func (sm *SyncManager) requestBlocksFromHeaders(peer *peerpkg.Peer,
 	state *peerSyncState, headers []wire.MsgHeader) {
 

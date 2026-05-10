@@ -253,26 +253,11 @@ func blockOnVictimTip(t *testing.T, victim *rpctest.Harness) *btcutil.Block {
 	return blk
 }
 
-// TestPeerQualityInvGating exercises the per-peer trust gate in
-// netsync.handleInvMsg (node/netsync/manager.go) and the corresponding
-// counter-reset path in handleBlockMsg.
-//
-// Sub-tests:
-//
-//   - low_quality_peer_inv_triggers_getheaders: a freshly-handshaked
-//     peer is low-quality (peerQualityCounter == peerQualityThreshold).
-//     Its block inv must be answered with `getheaders` first; no
-//     `getdata` is sent yet.
-//
-//   - high_quality_peer_inv_triggers_getdata: after the same peer
-//     supplies a tip-extending block (counter resets to 0), a follow-up
-//     block inv must be answered with `getdata` directly, without a
-//     preceding `getheaders`.
-//
-// Both sub-tests rely on chain.IsCurrent reporting true at the victim,
-// which requires the tip's timestamp to be within the last 24h. The
-// shared startCurrentVictim helper bootstraps that condition by mining
-// a single block on the victim itself.
+// TestPeerQualityInvGating exercises netsync.handleInvMsg's per-peer
+// gate: a low-quality peer's block inv triggers a cert-less getheaders
+// first; once the peer extends our tip, subsequent invs go straight to
+// getdata. Requires chain.IsCurrent==true; startCurrentVictim mines one
+// bootstrap block to satisfy it.
 func TestPeerQualityInvGating(t *testing.T) {
 	t.Run("low_quality_peer_inv_triggers_getheaders", func(t *testing.T) {
 		victim := startCurrentVictim(t)
@@ -290,8 +275,10 @@ func TestPeerQualityInvGating(t *testing.T) {
 			wire.NewInvVect(wire.InvTypeBlock, &bogus)))
 		sp.QueueMessage(inv, nil)
 
-		// !isPeerHighQuality branch: getheaders fires; no getdata.
-		sp.expectGetHeaders(t)
+		// Low-quality probe fires cert-less getheaders; no getdata yet.
+		gh := sp.expectGetHeaders(t)
+		require.False(t, gh.IncludeCertificates,
+			"low-quality probe must ask for cert-less headers")
 		sp.assertNoGetData(t)
 	})
 
@@ -316,12 +303,15 @@ func TestPeerQualityInvGating(t *testing.T) {
 			wire.NewInvVect(wire.InvTypeBlock, &blockAHash)))
 		sp.QueueMessage(invA, nil)
 
-		sp.expectGetHeaders(t)
+		gh := sp.expectGetHeaders(t)
+		require.False(t, gh.IncludeCertificates,
+			"low-quality probe must ask for cert-less headers")
 
+		// Honest cert-less response (Certificate == nil) must still
+		// trigger the follow-up getdata.
 		hdrs := wire.NewMsgHeaders()
 		require.NoError(t, hdrs.AddBlockHeader(
-			*blockA.MsgBlock().BlockHeader(),
-			blockA.MsgBlock().BlockCertificate()))
+			*blockA.MsgBlock().BlockHeader(), nil))
 		sp.QueueMessage(hdrs, nil)
 
 		sp.expectGetDataFor(t, &blockAHash)
