@@ -51,6 +51,14 @@ const (
 	// syncPeerCooldown is how long an address that stalled as syncnode
 	// is excluded from re-selection.
 	syncPeerCooldown = 10 * time.Minute
+
+	// lowQualityStrikeLimit is the number of accepted-but-not-tip blocks
+	// from a peer that is tolerated before the peer is treated as
+	// low-quality again. New peers start with strikes == limit (untrusted
+	// until proven). A block that becomes the new chain tip clears the
+	// strike count to 0. Each subsequent accepted-but-not-tip block adds
+	// one strike; once strikes >= limit the peer is back to low-quality.
+	lowQualityStrikeLimit = 5
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -156,6 +164,21 @@ type peerSyncState struct {
 	requestQueue    []*wire.InvVect
 	requestedTxns   map[chainhash.Hash]struct{}
 	requestedBlocks map[chainhash.Hash]struct{}
+
+	// nonTipStrikes tracks how stale this peer's recent block
+	// announcements are. Starts at lowQualityStrikeLimit (untrusted),
+	// resets to 0 on a tip-extending block, and increments on each
+	// accepted-but-not-tip block. While strikes < limit the peer is
+	// "high quality" and inv messages get a direct getdata; otherwise
+	// they go through getheaders first.
+	nonTipStrikes int
+}
+
+// isPeerHighQuality reports whether the peer has supplied enough near-tip
+// announcements to bypass the inv -> getheaders -> getdata round trip and
+// be trusted with direct block requests on inv announcements.
+func isPeerHighQuality(state *peerSyncState) bool {
+	return state.nonTipStrikes < lowQualityStrikeLimit
 }
 
 // limitAdd is a helper function for maps that require a maximum limit by
@@ -457,6 +480,7 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 		syncCandidate:   isSyncCandidate,
 		requestedTxns:   make(map[chainhash.Hash]struct{}),
 		requestedBlocks: make(map[chainhash.Hash]struct{}),
+		nonTipStrikes:   lowQualityStrikeLimit,
 	}
 
 	// Start syncing by choosing the best candidate if needed.
@@ -819,6 +843,15 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 		heightUpdate = best.Height
 		blkHashUpdate = &best.Hash
 
+		// Clear strikes when this peer extended our tip; otherwise the
+		// block was accepted but did not become tip, so drift the peer
+		// toward low quality.
+		if best.Hash == *blockHash {
+			state.nonTipStrikes = 0
+		} else if state.nonTipStrikes < lowQualityStrikeLimit {
+			state.nonTipStrikes++
+		}
+
 		// Clear the rejected transactions.
 		sm.rejectedTxns = make(map[chainhash.Hash]struct{})
 	}
@@ -943,28 +976,36 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	}
 }
 
-// handleHeadersMsg handles block header messages from all peers.  Headers are
-// requested when performing a headers-first sync.
+// handleHeadersMsg handles block header messages from all peers. Headers are
+// requested either as part of headers-first checkpoint sync, or as the
+// inv -> getheaders -> getdata round trip used for low-quality peers
+// (handleInvMsg gating).
 func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	peer := hmsg.peer
-	_, exists := sm.peerStates[peer]
+	state, exists := sm.peerStates[peer]
 	if !exists {
 		log.Warnf("Received headers message from unknown peer %s", peer)
 		return
 	}
 
-	// The remote peer is misbehaving if we didn't request headers.
 	msg := hmsg.headers
 	numHeaders := len(msg.Headers)
-	if !sm.headersFirstMode {
-		log.Warnf("Got %d unrequested headers from %s -- "+
-			"disconnecting", numHeaders, peer.Addr())
-		peer.Disconnect()
-		return
-	}
 
 	// Nothing to do for an empty headers message.
 	if numHeaders == 0 {
+		return
+	}
+
+	// Outside headers-first mode, this is either an inv-driven response
+	// from a low-quality peer or a BIP130 sendheaders tip announcement.
+	// Verify the first header builds on a block we know (basic anti-spam
+	// check), then request the corresponding blocks via getdata.
+	if !sm.headersFirstMode {
+		firstPrev := &msg.Headers[0].BlockHeader.PrevBlock
+		haveParent, err := sm.chain.HaveBlock(firstPrev)
+		if err == nil && haveParent {
+			sm.requestBlocksFromHeaders(peer, state, msg.Headers)
+		}
 		return
 	}
 
@@ -1183,6 +1224,11 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 	// request parent blocks of orphans if we receive one we already have.
 	// Finally, attempt to detect potential stalls due to long side chains
 	// we already have and request more blocks to prevent them.
+	//
+	// sentGetHeaders ensures we emit at most one inv-driven getheaders
+	// per inv message, regardless of how many low-quality block invs are
+	// present. The single locator covers all of them.
+	sentGetHeaders := false
 	for i, iv := range invVects {
 		// Ignore unsupported inventory types.
 		switch iv.Type {
@@ -1218,6 +1264,30 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 				if _, exists := sm.rejectedTxns[iv.Hash]; exists {
 					continue
 				}
+			}
+
+			// For unknown blocks announced by a peer that has not
+			// established near-tip quality, request headers first
+			// (without certificates). The headers response is
+			// validated and then converted into a getdata for the
+			// corresponding blocks; this extra round trip avoids
+			// fetching potentially bogus blocks straight from
+			// low-quality peers. Repeated invs from the same peer
+			// in a single message produce at most one getheaders;
+			// PushGetHeadersNoCertsMsg further coalesces consecutive
+			// requests with the same (locator, stopHash).
+			if iv.Type == wire.InvTypeBlock && sm.current() &&
+				!isPeerHighQuality(state) {
+
+				if !sentGetHeaders {
+					locator, err := sm.chain.LatestBlockLocator()
+					if err == nil {
+						_ = peer.PushGetHeadersNoCertsMsg(
+							locator, &zeroHash)
+					}
+					sentGetHeaders = true
+				}
+				continue
 			}
 
 			// Add it to the request queue.
@@ -1731,4 +1801,56 @@ func New(config *Config) (*SyncManager, error) {
 	sm.chain.Subscribe(sm.handleBlockchainNotification)
 
 	return &sm, nil
+}
+
+// requestBlocksFromHeaders extracts block hashes from a HEADERS batch
+// received in non-headers-first mode and emits a getdata for the ones we
+// don't already have or have already requested. Used to complete the
+// inv -> getheaders -> getdata round trip for low-quality peers (and any
+// BIP130 sendheaders announcements). Headers are not added to any
+// persistent header-only index; the chain entry is created when each full
+// block arrives via handleBlockMsg.
+//
+// The caller is responsible for verifying that headers[0].PrevBlock is a
+// block we know. From there this function walks the batch and only
+// requests blocks for headers that form an unbroken parent chain rooted
+// at that known parent; it stops at the first break, so a peer can't
+// smuggle in unconnected garbage by prepending one valid-parent header.
+func (sm *SyncManager) requestBlocksFromHeaders(peer *peerpkg.Peer,
+	state *peerSyncState, headers []wire.MsgHeader) {
+
+	if len(headers) == 0 {
+		return
+	}
+
+	expectedPrev := headers[0].BlockHeader.PrevBlock
+	gdmsg := wire.NewMsgGetData()
+	for i := range headers {
+		if headers[i].BlockHeader.PrevBlock != expectedPrev {
+			break
+		}
+		hash := headers[i].BlockHeader.BlockHash()
+		expectedPrev = hash
+
+		if _, exists := sm.requestedBlocks[hash]; exists {
+			continue
+		}
+		haveBlock, err := sm.chain.HaveBlock(&hash)
+		if err != nil {
+			log.Warnf("Failure when checking for existing block "+
+				"%v: %v", hash, err)
+			continue
+		}
+		if haveBlock {
+			continue
+		}
+		// SegWit is always active; request full witness blocks.
+		iv := wire.NewInvVect(wire.InvTypeWitnessBlock, &hash)
+		limitAdd(sm.requestedBlocks, hash, maxRequestedBlocks)
+		limitAdd(state.requestedBlocks, hash, maxRequestedBlocks)
+		gdmsg.AddInvVect(iv)
+	}
+	if len(gdmsg.InvList) > 0 {
+		peer.QueueMessage(gdmsg, nil)
+	}
 }
