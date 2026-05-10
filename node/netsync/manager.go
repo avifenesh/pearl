@@ -386,7 +386,7 @@ func (sm *SyncManager) startSync() {
 			best.Height < sm.nextCheckpoint.Height &&
 			sm.chainParams != &chaincfg.RegressionNetParams {
 
-			bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash)
+			bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
 			sm.headersFirstMode = true
 			log.Infof("Downloading headers for blocks %d to "+
 				"%d from peer %s", best.Height+1,
@@ -898,7 +898,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(prevHeight)
 	if sm.nextCheckpoint != nil {
 		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
-		err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash)
+		err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
 		if err != nil {
 			log.Warnf("Failed to send getheaders message to "+
 				"peer %s: %v", peer.Addr(), err)
@@ -1085,7 +1085,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// headers starting from the latest known header and ending with the
 	// next checkpoint.
 	locator := blockchain.BlockLocator([]*chainhash.Hash{finalHash})
-	err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash)
+	err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
 	if err != nil {
 		log.Warnf("Failed to send getheaders message to "+
 			"peer %s: %v", peer.Addr(), err)
@@ -1274,7 +1274,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			// fetching potentially bogus blocks straight from
 			// low-quality peers. Repeated invs from the same peer
 			// in a single message produce at most one getheaders;
-			// PushGetHeadersNoCertsMsg further coalesces consecutive
+			// PushGetHeadersMsg further coalesces consecutive
 			// requests with the same (locator, stopHash).
 			if iv.Type == wire.InvTypeBlock && sm.current() &&
 				!isPeerHighQuality(state) {
@@ -1282,8 +1282,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 				if !sentGetHeaders {
 					locator, err := sm.chain.LatestBlockLocator()
 					if err == nil {
-						_ = peer.PushGetHeadersNoCertsMsg(
-							locator, &zeroHash)
+						_ = peer.PushGetHeadersMsg(
+							locator, &zeroHash, false)
 					}
 					sentGetHeaders = true
 				}

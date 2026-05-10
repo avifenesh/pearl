@@ -936,28 +936,16 @@ func (p *Peer) PushGetBlocksMsg(locator blockchain.BlockLocator, stopHash *chain
 	return nil
 }
 
-// PushGetHeadersMsg sends a getheaders message for the provided block locator
-// and stop hash.  It will ignore back-to-back duplicate requests. The
-// response will include block certificates; for the cert-less variant used
-// by callers that only need bare headers, see PushGetHeadersNoCertsMsg.
+// PushGetHeadersMsg sends a getheaders message for the provided block
+// locator and stop hash. It will ignore back-to-back duplicate requests.
+// When includeCerts is true the peer is asked to include block
+// certificates in the response; when false only bare headers are
+// returned. The cert-less form is used by netsync's inv-driven
+// low-quality peer probe, where we only need the bare header chain to
+// decide whether the announced block is worth a follow-up getdata.
 //
 // This function is safe for concurrent access.
-func (p *Peer) PushGetHeadersMsg(locator blockchain.BlockLocator, stopHash *chainhash.Hash) error {
-	return p.pushGetHeadersMsg(locator, stopHash, true)
-}
-
-// PushGetHeadersNoCertsMsg is the same as PushGetHeadersMsg but asks the
-// remote peer to omit block certificates from the response. Used by the
-// inv-driven low-quality peer probe in netsync, where we only need the
-// bare header chain to decide whether the announced block is worth a
-// follow-up getdata.
-//
-// This function is safe for concurrent access.
-func (p *Peer) PushGetHeadersNoCertsMsg(locator blockchain.BlockLocator, stopHash *chainhash.Hash) error {
-	return p.pushGetHeadersMsg(locator, stopHash, false)
-}
-
-func (p *Peer) pushGetHeadersMsg(locator blockchain.BlockLocator, stopHash *chainhash.Hash, includeCerts bool) error {
+func (p *Peer) PushGetHeadersMsg(locator blockchain.BlockLocator, stopHash *chainhash.Hash, includeCerts bool) error {
 	// Extract the begin hash from the block locator, if one was specified,
 	// to use for filtering duplicate getheaders requests.
 	var beginHash *chainhash.Hash

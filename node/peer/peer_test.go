@@ -491,7 +491,7 @@ func TestOutboundPeer(t *testing.T) {
 		_, err = p.PushAddrMsg(addrs)
 		assert.NoError(t, err)
 		assert.NoError(t, p.PushGetBlocksMsg(nil, &chainhash.Hash{}))
-		assert.NoError(t, p.PushGetHeadersMsg(nil, &chainhash.Hash{}))
+		assert.NoError(t, p.PushGetHeadersMsg(nil, &chainhash.Hash{}, true))
 
 		p.PushRejectMsg("block", wire.RejectMalformed, "malformed", nil, false)
 		p.PushRejectMsg("block", wire.RejectInvalid, "invalid", nil, false)
