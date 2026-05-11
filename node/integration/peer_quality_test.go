@@ -28,10 +28,6 @@ import (
 )
 
 const (
-	// pqHandshakeTimeout bounds how long the scripted peer waits for
-	// the version/verack handshake with the victim node.
-	pqHandshakeTimeout = 15 * time.Second
-
 	// pqMessageBudget bounds the wait for a "must arrive" wire message
 	// from the victim. Generous enough to absorb single-message round
 	// trips on a loaded CI machine.
@@ -40,14 +36,6 @@ const (
 	// pqDrainBudget is how long we wait while asserting that a wire
 	// message must NOT arrive. Short enough to keep the test snappy.
 	pqDrainBudget = 1 * time.Second
-
-	// pqAcceptWait bounds how long the victim has to accept a block
-	// pushed by the scripted peer.
-	pqAcceptWait = 30 * time.Second
-
-	// pqCurrentWait bounds how long we wait for the victim to mine its
-	// initial bootstrap block via the local RPC.
-	pqCurrentWait = 30 * time.Second
 )
 
 // scriptedPeer is a fake p2p peer used to observe wire-level replies
@@ -58,13 +46,6 @@ type scriptedPeer struct {
 	*peer.Peer
 	getHeadersCh chan *wire.MsgGetHeaders
 	getDataCh    chan *wire.MsgGetData
-}
-
-// Close disconnects the underlying peer and waits for the read loop to
-// finish.
-func (sp *scriptedPeer) Close() {
-	sp.Disconnect()
-	sp.WaitForDisconnect()
 }
 
 // drain empties any pending messages from the observation channels.
@@ -79,24 +60,23 @@ func (sp *scriptedPeer) drain() {
 	}
 }
 
-// expectGetHeaders blocks for up to pqMessageBudget for a getheaders
-// message from the victim.
-func (sp *scriptedPeer) expectGetHeaders(t *testing.T) *wire.MsgGetHeaders {
+// expectCertlessGetHeaders waits for a getheaders from the victim and
+// asserts it requested cert-less headers.
+func (sp *scriptedPeer) expectCertlessGetHeaders(t *testing.T) {
 	t.Helper()
 	select {
 	case msg := <-sp.getHeadersCh:
-		return msg
+		require.False(t, msg.IncludeCertificates,
+			"low-quality probe must ask for cert-less headers")
 	case <-time.After(pqMessageBudget):
 		t.Fatal("scripted: timed out waiting for getheaders")
-		return nil
 	}
 }
 
 // expectGetDataFor blocks for up to pqMessageBudget for a getdata
-// message from the victim that includes hash and returns it.
-func (sp *scriptedPeer) expectGetDataFor(t *testing.T,
-	hash *chainhash.Hash) *wire.MsgGetData {
-
+// message from the victim that includes hash. The loop tolerates
+// interleaved relay/trickle getdatas that don't carry our target.
+func (sp *scriptedPeer) expectGetDataFor(t *testing.T, hash *chainhash.Hash) {
 	t.Helper()
 	deadline := time.After(pqMessageBudget)
 	for {
@@ -104,33 +84,24 @@ func (sp *scriptedPeer) expectGetDataFor(t *testing.T,
 		case msg := <-sp.getDataCh:
 			for _, iv := range msg.InvList {
 				if iv.Hash.IsEqual(hash) {
-					return msg
+					return
 				}
 			}
 		case <-deadline:
 			t.Fatalf("scripted: timed out waiting for getdata "+
 				"for %s", hash)
-			return nil
+			return
 		}
 	}
 }
 
-// assertNoGetHeaders waits pqDrainBudget and fails if any getheaders
-// message arrives in that window.
-func (sp *scriptedPeer) assertNoGetHeaders(t *testing.T) {
+// assertQuiet waits pqDrainBudget and fails if any getheaders or
+// getdata message arrives in that window.
+func (sp *scriptedPeer) assertQuiet(t *testing.T) {
 	t.Helper()
 	select {
 	case msg := <-sp.getHeadersCh:
 		t.Fatalf("scripted: unexpected getheaders: %+v", msg)
-	case <-time.After(pqDrainBudget):
-	}
-}
-
-// assertNoGetData waits pqDrainBudget and fails if any getdata message
-// arrives in that window.
-func (sp *scriptedPeer) assertNoGetData(t *testing.T) {
-	t.Helper()
-	select {
 	case msg := <-sp.getDataCh:
 		t.Fatalf("scripted: unexpected getdata: %+v", msg)
 	case <-time.After(pqDrainBudget):
@@ -172,7 +143,8 @@ func newScriptedPeer(t *testing.T, nodeAddr string) *scriptedPeer {
 				}
 			},
 		},
-		// Report LastBlock=0 in our outgoing version handshake.
+		// LastBlock=0 in our outgoing version handshake so the victim
+		// never demotes itself out of current() on our account.
 		NewestBlock: func() (*chainhash.Hash, int32, error) {
 			return &chainhash.Hash{}, 0, nil
 		},
@@ -194,7 +166,7 @@ func newScriptedPeer(t *testing.T, nodeAddr string) *scriptedPeer {
 	case <-verackCh:
 		sp.Peer = p
 		return sp
-	case <-time.After(pqHandshakeTimeout):
+	case <-time.After(15 * time.Second):
 		p.Disconnect()
 		p.WaitForDisconnect()
 		t.Fatal("scripted: timed out waiting for verack")
@@ -202,12 +174,10 @@ func newScriptedPeer(t *testing.T, nodeAddr string) *scriptedPeer {
 	}
 }
 
-// startCurrentVictim returns a fresh simnet rpctest harness whose tip
-// has a recent timestamp (so chain.IsCurrent reports true). One block
-// is mined on the victim itself via the local RPC; SimNet's PoW is a
-// dummy certificate so this is effectively instant. The harness is
-// registered for teardown via t.Cleanup.
-func startCurrentVictim(t *testing.T) *rpctest.Harness {
+// setupPeerQuality starts a fresh simnet victim with a one-block tip
+// (so chain.IsCurrent reports true) and connects a scripted peer to
+// it. Both are registered for teardown via t.Cleanup.
+func setupPeerQuality(t *testing.T) (*rpctest.Harness, *scriptedPeer) {
 	t.Helper()
 
 	victim, err := rpctest.New(&chaincfg.SimNetParams, nil, nil, "")
@@ -215,23 +185,27 @@ func startCurrentVictim(t *testing.T) *rpctest.Harness {
 	require.NoError(t, victim.SetUp(true, 0))
 	t.Cleanup(func() { require.NoError(t, victim.TearDown()) })
 
-	if _, err := victim.Client.Generate(1); err != nil {
-		t.Fatalf("startCurrentVictim: Generate(1): %v", err)
-	}
+	_, err = victim.Client.Generate(1)
+	require.NoError(t, err, "setupPeerQuality: Generate(1)")
 	require.Eventually(t, func() bool {
 		_, h, err := victim.Client.GetBestBlock()
 		return err == nil && h >= 1
-	}, pqCurrentWait, 100*time.Millisecond,
-		"startCurrentVictim: tip didn't advance to >=1")
+	}, 30*time.Second, 100*time.Millisecond,
+		"setupPeerQuality: tip didn't advance to >=1")
 
-	return victim
+	sp := newScriptedPeer(t, victim.P2PAddress())
+	t.Cleanup(func() {
+		sp.Disconnect()
+		sp.WaitForDisconnect()
+	})
+	sp.drain()
+	return victim, sp
 }
 
 // blockOnVictimTip constructs a simnet child block building on the
-// victim's current tip. The block timestamp is one second past the
-// parent's; this satisfies the "strictly increasing timestamp" rule
-// regardless of how quickly the test produces blocks. SimNet PoW is a
-// dummy certificate so block creation is effectively instant.
+// victim's current tip. The zero time.Time tells CreateBlock to use
+// prevBlockTime + 1s, satisfying the strictly-increasing timestamp
+// rule regardless of test pacing.
 func blockOnVictimTip(t *testing.T, victim *rpctest.Harness) *btcutil.Block {
 	t.Helper()
 
@@ -245,8 +219,6 @@ func blockOnVictimTip(t *testing.T, victim *rpctest.Harness) *btcutil.Block {
 	addr, err := victim.NewAddress()
 	require.NoError(t, err)
 
-	// Pass the zero time.Time so CreateBlock derives the timestamp as
-	// prevBlockTime + 1s -- guaranteed strictly after the parent.
 	blk, err := rpctest.CreateBlock(prevBlock, nil, rpctest.BlockVersion,
 		time.Time{}, addr, nil, &chaincfg.SimNetParams)
 	require.NoError(t, err)
@@ -256,59 +228,36 @@ func blockOnVictimTip(t *testing.T, victim *rpctest.Harness) *btcutil.Block {
 // TestPeerQualityInvGating exercises netsync.handleInvMsg's per-peer
 // gate: a low-quality peer's block inv triggers a cert-less getheaders
 // first; once the peer extends our tip, subsequent invs go straight to
-// getdata. Requires chain.IsCurrent==true; startCurrentVictim mines one
-// bootstrap block to satisfy it.
+// getdata.
 func TestPeerQualityInvGating(t *testing.T) {
 	t.Run("low_quality_peer_inv_triggers_getheaders", func(t *testing.T) {
-		victim := startCurrentVictim(t)
+		_, sp := setupPeerQuality(t)
 
-		sp := newScriptedPeer(t, victim.P2PAddress())
-		defer sp.Close()
-		sp.drain()
-
-		// A bogus block hash the victim cannot have. The choice of
-		// hash is irrelevant; we just need an unknown InvTypeBlock so
-		// haveInventory returns false.
 		bogus := chainhash.Hash{0xab, 0xcd, 0xef}
 		inv := wire.NewMsgInv()
 		require.NoError(t, inv.AddInvVect(
 			wire.NewInvVect(wire.InvTypeBlock, &bogus)))
 		sp.QueueMessage(inv, nil)
 
-		// Low-quality probe fires cert-less getheaders; no getdata yet.
-		gh := sp.expectGetHeaders(t)
-		require.False(t, gh.IncludeCertificates,
-			"low-quality probe must ask for cert-less headers")
-		sp.assertNoGetData(t)
+		sp.expectCertlessGetHeaders(t)
+		sp.assertQuiet(t)
 	})
 
 	t.Run("high_quality_peer_inv_triggers_getdata", func(t *testing.T) {
-		victim := startCurrentVictim(t)
+		victim, sp := setupPeerQuality(t)
 
-		sp := newScriptedPeer(t, victim.P2PAddress())
-		defer sp.Close()
-		sp.drain()
-
-		// Construct a child block in-process building on the victim's
-		// current tip. The victim does not yet know about this block.
 		blockA := blockOnVictimTip(t, victim)
 		blockAHash := blockA.MsgBlock().BlockHeader().BlockHash()
 
 		// Phase A: deliver blockA via inv -> getheaders -> getdata to
-		// flip the peer quality counter to 0 (high-quality). The peer
-		// starts low-quality so the inv path here MUST go through
-		// getheaders before getdata.
+		// flip the peer quality counter to 0 (high-quality).
 		invA := wire.NewMsgInv()
 		require.NoError(t, invA.AddInvVect(
 			wire.NewInvVect(wire.InvTypeBlock, &blockAHash)))
 		sp.QueueMessage(invA, nil)
 
-		gh := sp.expectGetHeaders(t)
-		require.False(t, gh.IncludeCertificates,
-			"low-quality probe must ask for cert-less headers")
+		sp.expectCertlessGetHeaders(t)
 
-		// Honest cert-less response (Certificate == nil) must still
-		// trigger the follow-up getdata.
 		hdrs := wire.NewMsgHeaders()
 		require.NoError(t, hdrs.AddBlockHeader(
 			*blockA.MsgBlock().BlockHeader(), nil))
@@ -317,32 +266,30 @@ func TestPeerQualityInvGating(t *testing.T) {
 		sp.expectGetDataFor(t, &blockAHash)
 		sp.QueueMessage(blockA.MsgBlock(), nil)
 
-		// Wait for the victim to accept blockA as its new tip. This
-		// is the synchronization point that guarantees handleBlockMsg
-		// has run and reset peerQualityCounter to 0.
+		// Synchronize on the tip advance so handleBlockMsg has run
+		// and reset peerQualityCounter to 0 before Phase B.
 		require.Eventually(t, func() bool {
 			_, h, err := victim.Client.GetBestBlock()
 			return err == nil && h >= 2
-		}, pqAcceptWait, 100*time.Millisecond,
+		}, 30*time.Second, 100*time.Millisecond,
 			"victim failed to accept blockA from scripted peer")
 
-		// Drain any messages queued by the relay/trickle path before
-		// asserting Phase B's quietness.
+		// Drain any relay/trickle messages queued by blockA's accept
+		// before asserting Phase B's quietness.
 		sp.drain()
 
-		// Construct blockB on top of (now-accepted) blockA.
 		blockB := blockOnVictimTip(t, victim)
 		blockBHash := blockB.MsgBlock().BlockHeader().BlockHash()
 
-		// Phase B: announce blockB. As a high-quality peer we MUST
-		// skip the inv -> getheaders gate and receive a direct
-		// getdata for blockB.
+		// Phase B: as a high-quality peer, the blockB inv must bypass
+		// the getheaders gate and yield a direct getdata, with no
+		// follow-up probe.
 		invB := wire.NewMsgInv()
 		require.NoError(t, invB.AddInvVect(
 			wire.NewInvVect(wire.InvTypeBlock, &blockBHash)))
 		sp.QueueMessage(invB, nil)
 
 		sp.expectGetDataFor(t, &blockBHash)
-		sp.assertNoGetHeaders(t)
+		sp.assertQuiet(t)
 	})
 }

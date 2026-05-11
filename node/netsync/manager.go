@@ -173,6 +173,14 @@ func isPeerHighQuality(state *peerSyncState) bool {
 	return state.nonTipStrikes < lowQualityStrikeLimit
 }
 
+// strikeNonTip records that a block from this peer did not extend
+// our tip (orphan, rejected, or accepted on a side chain).
+func (s *peerSyncState) strikeNonTip() {
+	if s.nonTipStrikes < lowQualityStrikeLimit {
+		s.nonTipStrikes++
+	}
+}
+
 // limitAdd is a helper function for maps that require a maximum limit by
 // evicting a random value if adding the new value would cause it to
 // overflow the maximum allowed.
@@ -776,6 +784,8 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 			panic(dbErr)
 		}
 
+		state.strikeNonTip()
+
 		// Convert the error into an appropriate reject message and
 		// send it.
 		code, reason := mempool.ErrToRejectErr(err)
@@ -812,6 +822,8 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 			blkHashUpdate = blockHash
 		}
 
+		state.strikeNonTip()
+
 		orphanRoot := sm.chain.GetOrphanRoot(blockHash)
 		locator, err := sm.chain.LatestBlockLocator()
 		if err != nil {
@@ -835,13 +847,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 		heightUpdate = best.Height
 		blkHashUpdate = &best.Hash
 
-		// Clear strikes when this peer extended our tip; otherwise the
-		// block was accepted but did not become tip, so drift the peer
-		// toward low quality.
+		// Only a tip-extending block resets strikes; accepted-but-
+		// not-tip blocks drift the peer toward low quality.
 		if best.Hash == *blockHash {
 			state.nonTipStrikes = 0
-		} else if state.nonTipStrikes < lowQualityStrikeLimit {
-			state.nonTipStrikes++
+		} else {
+			state.strikeNonTip()
 		}
 
 		// Clear the rejected transactions.
@@ -986,13 +997,45 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	// Non-headers-first: BIP130 announce or low-quality inv response.
+	// Non-headers-first: low-quality inv response (or a future BIP130
+	// announce). Request getdata only when the entire batch forms an
+	// unbroken parent chain rooted at headers[0].PrevBlock and that
+	// root is already known to us.
 	if !sm.headersFirstMode {
-		firstPrev := &msg.Headers[0].BlockHeader.PrevBlock
-		if have, err := sm.chain.HaveBlock(firstPrev); err != nil || !have {
+		root := msg.Headers[0].BlockHeader.PrevBlock
+		havePrev, errPrev := sm.chain.HaveBlock(&root)
+		if errPrev != nil || !havePrev {
 			return
 		}
-		sm.requestBlocksFromHeaders(peer, state, msg.Headers)
+		firstHash := msg.Headers[0].BlockHeader.BlockHash()
+		haveFirst, errFirst := sm.chain.HaveBlock(&firstHash)
+		if errFirst != nil || haveFirst {
+			return
+		}
+
+		expectedPrev := root
+		for _, header := range msg.Headers {
+			if header.BlockHeader.PrevBlock != expectedPrev {
+				return
+			}
+			expectedPrev = header.BlockHeader.BlockHash()
+		}
+
+		gdmsg := wire.NewMsgGetData()
+		for i := range msg.Headers {
+			hash := msg.Headers[i].BlockHeader.BlockHash()
+			if _, exists := sm.requestedBlocks[hash]; exists {
+				continue
+			}
+			// SegWit is always active; request full witness blocks.
+			iv := wire.NewInvVect(wire.InvTypeWitnessBlock, &hash)
+			limitAdd(sm.requestedBlocks, hash, maxRequestedBlocks)
+			limitAdd(state.requestedBlocks, hash, maxRequestedBlocks)
+			gdmsg.AddInvVect(iv)
+		}
+		if len(gdmsg.InvList) > 0 {
+			peer.QueueMessage(gdmsg, nil)
+		}
 		return
 	}
 
@@ -1252,8 +1295,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			}
 
 			// Low-quality peer: probe with cert-less getheaders first;
-			// requestBlocksFromHeaders converts a valid response into
-			// getdata. At most one probe per inv batch.
+			// handleHeadersMsg converts a valid response into getdata.
+			// At most one probe per inv batch.
 			if iv.Type == wire.InvTypeBlock && sm.current() &&
 				!isPeerHighQuality(state) {
 
@@ -1779,47 +1822,4 @@ func New(config *Config) (*SyncManager, error) {
 	sm.chain.Subscribe(sm.handleBlockchainNotification)
 
 	return &sm, nil
-}
-
-// requestBlocksFromHeaders emits getdata for headers in the batch that
-// form an unbroken parent chain rooted at headers[0].PrevBlock, stopping
-// at the first link break. Caller must verify headers[0].PrevBlock is a
-// block we already have.
-func (sm *SyncManager) requestBlocksFromHeaders(peer *peerpkg.Peer,
-	state *peerSyncState, headers []wire.MsgHeader) {
-
-	if len(headers) == 0 {
-		return
-	}
-
-	expectedPrev := headers[0].BlockHeader.PrevBlock
-	gdmsg := wire.NewMsgGetData()
-	for i := range headers {
-		if headers[i].BlockHeader.PrevBlock != expectedPrev {
-			break
-		}
-		hash := headers[i].BlockHeader.BlockHash()
-		expectedPrev = hash
-
-		if _, exists := sm.requestedBlocks[hash]; exists {
-			continue
-		}
-		haveBlock, err := sm.chain.HaveBlock(&hash)
-		if err != nil {
-			log.Warnf("Failure when checking for existing block "+
-				"%v: %v", hash, err)
-			continue
-		}
-		if haveBlock {
-			continue
-		}
-		// SegWit is always active; request full witness blocks.
-		iv := wire.NewInvVect(wire.InvTypeWitnessBlock, &hash)
-		limitAdd(sm.requestedBlocks, hash, maxRequestedBlocks)
-		limitAdd(state.requestedBlocks, hash, maxRequestedBlocks)
-		gdmsg.AddInvVect(iv)
-	}
-	if len(gdmsg.InvList) > 0 {
-		peer.QueueMessage(gdmsg, nil)
-	}
 }
