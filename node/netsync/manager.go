@@ -1043,6 +1043,9 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		}
 		return
 	}
+	if peer != sm.syncPeer {
+		return
+	}
 
 	// Process all of the received headers ensuring each one connects to the
 	// previous and that checkpoints match.
