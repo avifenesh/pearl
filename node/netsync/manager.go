@@ -162,8 +162,9 @@ type peerSyncState struct {
 	requestedBlocks map[chainhash.Hash]struct{}
 
 	// nonTipStrikes counts consecutive non-tip-extending blocks from
-	// this peer. Starts at lowQualityStrikeLimit; resets to 0 on a
-	// tip-extending block; saturates on each accepted-but-not-tip one.
+	// this peer. Starts at lowQualityStrikeLimit for inbound peers, 0
+	// for outbound peers; resets to 0 on a tip-extending block;
+	// saturates on each accepted-but-not-tip one.
 	nonTipStrikes int
 }
 
@@ -476,11 +477,15 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 
 	// Initialize the peer state.
 	isSyncCandidate := sm.isSyncCandidate(peer)
+	initialStrikes := lowQualityStrikeLimit
+	if !peer.Inbound() {
+		initialStrikes = 0
+	}
 	sm.peerStates[peer] = &peerSyncState{
 		syncCandidate:   isSyncCandidate,
 		requestedTxns:   make(map[chainhash.Hash]struct{}),
 		requestedBlocks: make(map[chainhash.Hash]struct{}),
-		nonTipStrikes:   lowQualityStrikeLimit,
+		nonTipStrikes:   initialStrikes,
 	}
 
 	// Start syncing by choosing the best candidate if needed.
