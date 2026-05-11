@@ -8,7 +8,6 @@ validate('prl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsvum09k');
 
 getAddressInfo('prl1zx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsypzqta');
 ==> {
-  bech32: true,
   network: 'mainnet',
   address: 'prl1zx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsypzqta',
   type: 'p2mr'
@@ -65,8 +64,7 @@ getAddressInfo('prl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsvum09k'
 ==> {
   address: 'prl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsvum09k',
   type: 'p2tr',
-  network: 'mainnet',
-  bech32: true
+  network: 'mainnet'
 }
 ```
 
@@ -81,29 +79,12 @@ Both encode as bech32m with a 32-byte witness program. Witness versions other th
 
 Supported networks: `mainnet` (`prl`), `testnet` (`tprl`), `simnet` (`rprl`).
 
-#### Casting testnet addresses to regtest or simnet
-
-Use the `options` parameter to cast a `testnet` result to `regtest` or `simnet`.
-
-```js
-getAddressInfo('tprl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqts8nl36r', {
-  castTestnetTo: 'simnet'
-})
-==> {
-  address: 'tprl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqts8nl36r',
-  type: 'p2tr',
-  network: 'simnet',
-  bech32: true
-}
-```
-
 ### TypeScript
 
 ```ts
 enum Network {
   mainnet = 'mainnet',
   testnet = 'testnet',
-  regtest = 'regtest',
   simnet = 'simnet',
 }
 
@@ -113,7 +94,6 @@ enum AddressType {
 }
 
 type AddressInfo = {
-  bech32: boolean;
   network: Network;
   address: string;
   type: AddressType;

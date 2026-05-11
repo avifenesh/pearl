@@ -3,7 +3,6 @@ import { bech32m } from 'bech32';
 enum Network {
   mainnet = 'mainnet',
   testnet = 'testnet',
-  regtest = 'regtest',
   simnet = 'simnet',
 }
 
@@ -13,14 +12,9 @@ enum AddressType {
 }
 
 type AddressInfo = {
-  bech32: boolean;
   network: Network;
   address: string;
   type: AddressType;
-};
-
-type Options = {
-  castTestnetTo?: Network.regtest | Network.simnet;
 };
 
 const prefixToNetwork: { [key: string]: Network } = {
@@ -34,31 +28,12 @@ const witnessVersionToType: { [key: number]: AddressType } = {
   2: AddressType.p2mr,
 };
 
-function castTestnetTo(fromNetwork: Network, toNetwork?: Network.regtest | Network.simnet): Network {
-  if (!toNetwork) {
-    return fromNetwork;
-  }
-
-  if (fromNetwork === Network.mainnet) {
-    throw new Error('Cannot cast mainnet to non-mainnet');
-  }
-
-  return toNetwork;
-}
-
-const normalizeAddressInfo = (addressInfo: AddressInfo, options?: Options): AddressInfo => {
-  return {
-    ...addressInfo,
-    network: castTestnetTo(addressInfo.network, options?.castTestnetTo),
-  };
-};
-
-const getAddressInfo = (address: string, options?: Options): AddressInfo => {
+const getAddressInfo = (address: string): AddressInfo => {
   let decoded;
 
   try {
     decoded = bech32m.decode(address);
-  } catch (error) {
+  } catch {
     throw new Error('Invalid address');
   }
 
@@ -86,27 +61,19 @@ const getAddressInfo = (address: string, options?: Options): AddressInfo => {
     throw new Error('Invalid address');
   }
 
-  return normalizeAddressInfo(
-    {
-      bech32: true,
-      network,
-      address,
-      type,
-    },
-    options,
-  );
+  return { network, address, type };
 };
 
-const validate = (address: string, network?: Network, options?: Options) => {
+const validate = (address: string, network?: Network): boolean => {
   try {
-    const addressInfo = getAddressInfo(address, options);
+    const addressInfo = getAddressInfo(address);
 
     if (network) {
       return network === addressInfo.network;
     }
 
     return true;
-  } catch (error) {
+  } catch {
     return false;
   }
 };

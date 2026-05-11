@@ -13,7 +13,6 @@ describe('Pearl Address Validation', () => {
     it('validates Mainnet P2TR', () => {
       expect(validate(MAINNET_P2TR)).toBe(true);
       expect(getAddressInfo(MAINNET_P2TR)).toEqual({
-        bech32: true,
         type: 'p2tr',
         network: 'mainnet',
         address: MAINNET_P2TR,
@@ -23,7 +22,6 @@ describe('Pearl Address Validation', () => {
     it('validates Testnet P2TR', () => {
       expect(validate(TESTNET_P2TR)).toBe(true);
       expect(getAddressInfo(TESTNET_P2TR)).toEqual({
-        bech32: true,
         type: 'p2tr',
         network: 'testnet',
         address: TESTNET_P2TR,
@@ -33,7 +31,6 @@ describe('Pearl Address Validation', () => {
     it('validates Simnet P2TR', () => {
       expect(validate(SIMNET_P2TR)).toBe(true);
       expect(getAddressInfo(SIMNET_P2TR)).toEqual({
-        bech32: true,
         type: 'p2tr',
         network: 'simnet',
         address: SIMNET_P2TR,
@@ -45,7 +42,6 @@ describe('Pearl Address Validation', () => {
     it('validates Mainnet P2MR', () => {
       expect(validate(MAINNET_P2MR)).toBe(true);
       expect(getAddressInfo(MAINNET_P2MR)).toEqual({
-        bech32: true,
         type: 'p2mr',
         network: 'mainnet',
         address: MAINNET_P2MR,
@@ -55,7 +51,6 @@ describe('Pearl Address Validation', () => {
     it('validates Testnet P2MR', () => {
       expect(validate(TESTNET_P2MR)).toBe(true);
       expect(getAddressInfo(TESTNET_P2MR)).toEqual({
-        bech32: true,
         type: 'p2mr',
         network: 'testnet',
         address: TESTNET_P2MR,
@@ -65,7 +60,6 @@ describe('Pearl Address Validation', () => {
     it('validates Simnet P2MR', () => {
       expect(validate(SIMNET_P2MR)).toBe(true);
       expect(getAddressInfo(SIMNET_P2MR)).toEqual({
-        bech32: true,
         type: 'p2mr',
         network: 'simnet',
         address: SIMNET_P2MR,
