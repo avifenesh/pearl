@@ -112,11 +112,6 @@ type redownloadCursor struct {
 	bits          uint32
 }
 
-type approvedEntry struct {
-	Hash   chainhash.Hash
-	Header wire.BlockHeader
-}
-
 // HeadersSyncState implements the two-phase headers presync state machine.
 type HeadersSyncState struct {
 	peerID      int32
@@ -124,19 +119,13 @@ type HeadersSyncState struct {
 
 	chainStart          chainStartInfo
 	minimumRequiredWork *big.Int
-	chainStartNextNBits uint32
 
 	workNormalization float64
 	hashSalt          [16]byte
 
 	phase HeadersSyncPhase
 
-	lastHeaderReceived       wire.BlockHeader
-	lastHeaderReceivedPrevTs int64
-	lastHeaderHash           chainhash.Hash
-	currentHeight            int32
-	currentChainWork         *big.Int
-	nextExpectedNBits        uint32
+	tip blockchain.ChainStartInfo
 
 	headerCommitments *BitDeque
 
@@ -148,10 +137,10 @@ type HeadersSyncState struct {
 	nextCpIdx   int
 
 	// Tier-1: approved cert-less REDOWNLOAD headers awaiting block fetch.
-	redownloadApproved []approvedEntry
+	redownloadApproved []chainhash.Hash
 
 	// Tier-2: entries promoted from Tier-1, getdata sent, awaiting blocks.
-	tier2Expected []approvedEntry
+	tier2Expected []chainhash.Hash
 	tier2Pending  map[chainhash.Hash]*btcutil.Block
 
 	redownloadCursor           redownloadCursor
@@ -185,8 +174,14 @@ func NewHeadersSyncState(
 		chainStart:          start,
 		minimumRequiredWork: new(big.Int).Set(minimumRequiredWork),
 		phase:               PhasePresync,
-		currentHeight:       start.Height,
-		currentChainWork:    new(big.Int).Set(start.WorkSum),
+		tip: blockchain.ChainStartInfo{
+			Hash:          start.Hash,
+			Height:        start.Height,
+			Bits:          start.Bits,
+			Timestamp:     start.Timestamp,
+			WorkSum:       new(big.Int).Set(start.WorkSum),
+			PrevTimestamp: start.PrevTimestamp,
+		},
 		headerCommitments:   NewBitDeque(1024),
 		redownloadChainWork: new(big.Int),
 		lastProgress:        time.Now(),
@@ -202,19 +197,6 @@ func NewHeadersSyncState(
 	rand.Read(s.hashSalt[:])
 	s.scheduleNextSpotCheck(start.Height)
 
-	s.lastHeaderReceived = wire.BlockHeader{
-		Bits:      start.Bits,
-		Timestamp: time.Unix(start.Timestamp, 0),
-	}
-	s.lastHeaderReceivedPrevTs = start.PrevTimestamp
-	s.lastHeaderHash = start.Hash
-
-	s.chainStartNextNBits = s.computeNextNBits(
-		start.Height, start.Bits,
-		start.Timestamp, start.PrevTimestamp,
-	)
-	s.nextExpectedNBits = s.chainStartNextNBits
-
 	remainingWork := new(big.Int).Sub(s.minimumRequiredWork, s.chainStart.WorkSum)
 	if remainingWork.Sign() > 0 {
 		rw, _ := new(big.Float).SetInt(remainingWork).Float64()
@@ -224,7 +206,7 @@ func NewHeadersSyncState(
 
 	log.Infof("Headers presync started with peer=%d (%s): height=%d, "+
 		"min_work=%s, work_norm=%e",
-		peerID, peerAddr, s.currentHeight,
+		peerID, peerAddr, s.tip.Height,
 		s.minimumRequiredWork, s.workNormalization)
 
 	return s
@@ -232,11 +214,6 @@ func NewHeadersSyncState(
 
 // Phase returns the current phase.
 func (s *HeadersSyncState) Phase() HeadersSyncPhase { return s.phase }
-
-// LastHeaderHash returns the hash of the last header processed in PRESYNC.
-func (s *HeadersSyncState) LastHeaderHash() chainhash.Hash {
-	return s.lastHeaderHash
-}
 
 // Done reports whether the session is fully complete (REDOWNLOAD finished,
 // all tiers drained). The caller should nil the session pointer.
@@ -265,7 +242,7 @@ func (s *HeadersSyncState) NextHeadersRequestLocator() []*chainhash.Hash {
 	var tipHash chainhash.Hash
 	switch s.phase {
 	case PhasePresync:
-		tipHash = s.lastHeaderHash
+		tipHash = s.tip.Hash
 	case PhaseRedownload:
 		tipHash = s.redownloadCursor.hash
 	}
@@ -323,12 +300,13 @@ func (s *HeadersSyncState) ProcessNextHeaders(
 				}
 				log.Infof("Headers presync with peer=%d: "+
 					"height=%d, commitments=%d, pending_checks=%d",
-					s.peerID, s.currentHeight,
+					s.peerID, s.tip.Height,
 					s.headerCommitments.Len(),
 					len(s.pendingSpotChecks))
 			default:
 				log.Infof("Headers presync aborted with peer=%d: "+
-					"incomplete message at height=%d", s.peerID, s.currentHeight)
+					"peer chain ended at height=%d without sufficient work",
+					s.peerID, s.tip.Height)
 			}
 		}
 
@@ -405,15 +383,10 @@ func (s *HeadersSyncState) BlocksToRequest() []chainhash.Hash {
 	}
 	n = min(n, len(s.redownloadApproved))
 
-	popped := make([]approvedEntry, n)
-	copy(popped, s.redownloadApproved[:n])
-	s.redownloadApproved = s.redownloadApproved[n:]
-
 	hashes := make([]chainhash.Hash, n)
-	for i := range popped {
-		hashes[i] = popped[i].Hash
-		s.tier2Expected = append(s.tier2Expected, popped[i])
-	}
+	copy(hashes, s.redownloadApproved[:n])
+	s.tier2Expected = append(s.tier2Expected, hashes...)
+	s.redownloadApproved = s.redownloadApproved[n:]
 	return hashes
 }
 
@@ -431,12 +404,6 @@ func (s *HeadersSyncState) BlockArrived(hash chainhash.Hash, block *btcutil.Bloc
 	if idx < 0 {
 		return result
 	}
-	entry := s.tier2Expected[idx]
-
-	if hash != entry.Hash {
-		result.Mismatch = true
-		return result
-	}
 
 	if s.tier2Pending == nil {
 		s.tier2Pending = make(map[chainhash.Hash]*btcutil.Block, redownloadPendingCap)
@@ -446,11 +413,11 @@ func (s *HeadersSyncState) BlockArrived(hash chainhash.Hash, block *btcutil.Bloc
 	// Drain in insertion order.
 	for len(s.tier2Expected) > 0 {
 		head := s.tier2Expected[0]
-		pending, ok := s.tier2Pending[head.Hash]
+		pending, ok := s.tier2Pending[head]
 		if !ok {
 			break
 		}
-		delete(s.tier2Pending, head.Hash)
+		delete(s.tier2Pending, head)
 		s.tier2Expected = s.tier2Expected[1:]
 		result.ReadyBlocks = append(result.ReadyBlocks, pending)
 	}
@@ -468,10 +435,7 @@ func (s *HeadersSyncState) BlockArrived(hash chainhash.Hash, block *btcutil.Bloc
 // Abort tears down the session and returns in-flight Tier-2 hashes
 // for cleanup from requestedBlocks.
 func (s *HeadersSyncState) Abort() []chainhash.Hash {
-	var hashes []chainhash.Hash
-	for i := range s.tier2Expected {
-		hashes = append(hashes, s.tier2Expected[i].Hash)
-	}
+	hashes := s.tier2Expected
 	s.tier2Expected = nil
 	s.tier2Pending = nil
 	s.finalize()
@@ -503,14 +467,14 @@ func (s *HeadersSyncState) handleSpotCheckResponse(hwc wire.MsgHeader, scIdx int
 			"height=%d, pending=%d",
 			s.peerID, scHeight, len(s.pendingSpotChecks))
 
-		if s.currentChainWork.Cmp(s.minimumRequiredWork) >= 0 &&
+		if s.tip.WorkSum.Cmp(s.minimumRequiredWork) >= 0 &&
 			len(s.pendingSpotChecks) == 0 {
 			s.transitionToRedownload()
 			result.RequestMore = true
 			s.awaitingHeaders = true
 			log.Infof("Headers presync transition with peer=%d: "+
 				"sufficient work at height=%d, redownloading from height=%d",
-				s.peerID, s.currentHeight, s.redownloadCursor.height)
+				s.peerID, s.tip.Height, s.redownloadCursor.height)
 		} else if !s.spotCheckBackpressured() && !s.presyncWorkSufficient() {
 			result.RequestMore = true
 			s.awaitingHeaders = true
@@ -538,12 +502,12 @@ func (s *HeadersSyncState) findPendingSpotCheck(h chainhash.Hash) int {
 
 func (s *HeadersSyncState) spotCheckBackpressured() bool {
 	return len(s.pendingSpotChecks) > 0 &&
-		s.currentHeight-s.pendingSpotChecks[0].height >= spotCheckMeanGap
+		s.tip.Height-s.pendingSpotChecks[0].height >= spotCheckMeanGap
 }
 
 func (s *HeadersSyncState) presyncWorkSufficient() bool {
 	return s.phase == PhasePresync &&
-		s.currentChainWork.Cmp(s.minimumRequiredWork) >= 0
+		s.tip.WorkSum.Cmp(s.minimumRequiredWork) >= 0
 }
 
 // --- internal: phase transitions ---
@@ -558,7 +522,6 @@ func (s *HeadersSyncState) transitionToRedownload() {
 		bits:          s.chainStart.Bits,
 	}
 	s.redownloadChainWork = new(big.Int).Set(s.chainStart.WorkSum)
-	s.nextExpectedNBits = s.chainStartNextNBits
 	s.nextCpIdx = 0
 	s.phase = PhaseRedownload
 }
@@ -579,43 +542,37 @@ func (s *HeadersSyncState) validateAndStoreCommitments(headers []wire.MsgHeader)
 		return false
 	}
 
-	if headers[0].BlockHeader.PrevBlock != s.lastHeaderHash {
-		log.Infof("Headers presync aborted with peer=%d: "+
-			"non-continuous at height=%d", s.peerID, s.currentHeight)
-		return false
-	}
-
 	for i := range headers {
 		if !s.validateAndProcessSingleHeader(&headers[i]) {
 			return false
 		}
 
-		spotCheck := s.currentHeight == s.nextSpotCheckHeight ||
+		spotCheck := s.tip.Height == s.nextSpotCheckHeight ||
 			s.shouldSpotCheckByWork(blockchain.CalcWork(headers[i].BlockHeader.Bits))
 
 		if spotCheck {
 			hwc := &headers[i]
 			s.pendingSpotChecks = append(s.pendingSpotChecks, pendingSpotCheck{
-				height:    s.currentHeight,
-				hash:      s.lastHeaderHash,
+				height:    s.tip.Height,
+				hash:      s.tip.Hash,
 				prevBlock: hwc.BlockHeader.PrevBlock,
 			})
-			s.scheduleNextSpotCheck(s.currentHeight)
+			s.scheduleNextSpotCheck(s.tip.Height)
 		}
 
-		if s.currentChainWork.Cmp(s.minimumRequiredWork) >= 0 {
+		if s.tip.WorkSum.Cmp(s.minimumRequiredWork) >= 0 {
 			break
 		}
 	}
 
-	if s.currentChainWork.Cmp(s.minimumRequiredWork) >= 0 {
+	if s.tip.WorkSum.Cmp(s.minimumRequiredWork) >= 0 {
 		if len(s.pendingSpotChecks) > 0 {
 			return true
 		}
 		s.transitionToRedownload()
 		log.Infof("Headers presync transition with peer=%d: "+
 			"sufficient work at height=%d, redownloading from height=%d",
-			s.peerID, s.currentHeight, s.redownloadCursor.height)
+			s.peerID, s.tip.Height, s.redownloadCursor.height)
 	}
 	return true
 }
@@ -625,11 +582,10 @@ func (s *HeadersSyncState) validateAndProcessSingleHeader(hwc *wire.MsgHeader) b
 		return false
 	}
 	header := &hwc.BlockHeader
-	nextHeight := s.currentHeight + 1
+	nextHeight := s.tip.Height + 1
 
-	parentTs := s.lastHeaderReceived.Timestamp.Unix()
-	if !s.checkHeaderTransition(header, s.currentHeight,
-		s.lastHeaderReceived.Bits, parentTs, s.lastHeaderReceivedPrevTs, nil) {
+	if !s.checkHeaderTransition(header, s.tip.Height,
+		s.tip.Bits, s.tip.Timestamp, s.tip.PrevTimestamp, &s.tip.Hash) {
 		return false
 	}
 
@@ -643,16 +599,14 @@ func (s *HeadersSyncState) validateAndProcessSingleHeader(hwc *wire.MsgHeader) b
 	s.headerCommitments.PushBack(bit)
 
 	work := blockchain.CalcWork(header.Bits)
-	s.currentChainWork = new(big.Int).Add(s.currentChainWork, work)
-
-	s.nextExpectedNBits = s.computeNextNBits(
-		nextHeight, header.Bits,
-		header.Timestamp.Unix(), parentTs,
-	)
-	s.lastHeaderReceivedPrevTs = parentTs
-	s.lastHeaderReceived = *header
-	s.lastHeaderHash = headerHash
-	s.currentHeight = nextHeight
+	s.tip = blockchain.ChainStartInfo{
+		Hash:          headerHash,
+		Height:        nextHeight,
+		Bits:          header.Bits,
+		Timestamp:     header.Timestamp.Unix(),
+		WorkSum:       new(big.Int).Add(s.tip.WorkSum, work),
+		PrevTimestamp: s.tip.Timestamp,
+	}
 	return true
 }
 
@@ -699,10 +653,7 @@ func (s *HeadersSyncState) validateAndStoreRedownloadedHeader(hwc *wire.MsgHeade
 		s.processAllRemainingHeaders = true
 	}
 
-	s.redownloadApproved = append(s.redownloadApproved, approvedEntry{
-		Hash:   headerHash,
-		Header: *header,
-	})
+	s.redownloadApproved = append(s.redownloadApproved, headerHash)
 
 	headerTs := header.Timestamp.Unix()
 	s.redownloadCursor = redownloadCursor{
@@ -712,11 +663,6 @@ func (s *HeadersSyncState) validateAndStoreRedownloadedHeader(hwc *wire.MsgHeade
 		height:        nextHeight,
 		bits:          header.Bits,
 	}
-
-	s.nextExpectedNBits = s.computeNextNBits(
-		nextHeight, header.Bits,
-		headerTs, cursor.timestamp,
-	)
 	return true
 }
 
@@ -731,7 +677,7 @@ func (s *HeadersSyncState) checkHeaderTransition(
 	nextHeight := parentHeight + 1
 
 	if prevHash != nil && header.PrevBlock != *prevHash {
-		log.Infof("Headers %s aborted with peer=%d: "+
+		log.Warnf("Headers %s aborted with peer=%d: "+
 			"non-continuous at height=%d", phaseName, s.peerID, nextHeight)
 		return false
 	}
@@ -776,16 +722,6 @@ func (s *HeadersSyncState) verifyCheckpoint(nextHeight int32, headerHash *chainh
 
 func (s *HeadersSyncState) commitBit(hash chainhash.Hash) bool {
 	return siphash.Sum64(hash[:], &s.hashSalt)&1 != 0
-}
-
-func (s *HeadersSyncState) computeNextNBits(height int32, bits uint32, ts, prevTs int64) uint32 {
-	result, err := blockchain.CalcNextRequiredDifficultyFromValues(
-		s.chainParams, height, bits, ts, prevTs,
-	)
-	if err != nil {
-		return s.chainParams.PowLimitBits
-	}
-	return result
 }
 
 func (s *HeadersSyncState) shouldSpotCheckByWork(headerWork *big.Int) bool {
@@ -840,7 +776,7 @@ func (s *HeadersSyncState) readyForNextHeaders() bool {
 
 func (s *HeadersSyncState) tier2EntryIndex(hash chainhash.Hash) int {
 	for i := range s.tier2Expected {
-		if s.tier2Expected[i].Hash == hash {
+		if s.tier2Expected[i] == hash {
 			return i
 		}
 	}

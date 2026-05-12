@@ -100,7 +100,7 @@ func TestPresyncWorkSufficient(t *testing.T) {
 
 	require.False(t, s.presyncWorkSufficient())
 
-	s.currentChainWork = new(big.Int).Add(minWork, big.NewInt(1))
+	s.tip.WorkSum = new(big.Int).Add(minWork, big.NewInt(1))
 	require.True(t, s.presyncWorkSufficient())
 }
 
@@ -188,14 +188,6 @@ func TestCommitBitSipHashKnownVector(t *testing.T) {
 
 // --- Hash accessors ---
 
-func TestLastHeaderHashAccessor(t *testing.T) {
-	s := NewHeadersSyncState(1, "", makeTestParams(), makeChainStart(100), big.NewInt(5000))
-	require.Equal(t, s.chainStart.Hash, s.LastHeaderHash())
-
-	h := chainhash.Hash{0xab, 0xcd}
-	s.lastHeaderHash = h
-	require.Equal(t, h, s.LastHeaderHash())
-}
 
 func TestShouldSpotCheckByWorkHighProb(t *testing.T) {
 	params := makeTestParams()
@@ -220,13 +212,25 @@ func newRedownloadState(t *testing.T) *HeadersSyncState {
 	s := NewHeadersSyncState(1, "", makeTestParams(), makeChainStart(100), big.NewInt(5000))
 	s.phase = PhaseRedownload
 	s.redownloadCursor = redownloadCursor{
-		hash:      s.chainStart.Hash,
-		timestamp: s.chainStart.Timestamp,
-		height:    s.chainStart.Height,
+		hash:          s.chainStart.Hash,
+		timestamp:     s.chainStart.Timestamp,
+		prevTimestamp: s.chainStart.PrevTimestamp,
+		height:        s.chainStart.Height,
+		bits:          s.chainStart.Bits,
 	}
 	s.processAllRemainingHeaders = true
-	s.nextExpectedNBits = s.chainStartNextNBits
 	return s
+}
+
+func expectedNextNBits(s *HeadersSyncState) uint32 {
+	c := s.redownloadCursor
+	nbits, err := blockchain.CalcNextRequiredDifficultyFromValues(
+		s.chainParams, c.height, c.bits, c.timestamp, c.prevTimestamp,
+	)
+	if err != nil {
+		return s.chainParams.PowLimitBits
+	}
+	return nbits
 }
 
 func buildValidRedownloadHeader(s *HeadersSyncState) *wire.MsgHeader {
@@ -234,7 +238,7 @@ func buildValidRedownloadHeader(s *HeadersSyncState) *wire.MsgHeader {
 		Version:         1,
 		PrevBlock:       s.redownloadCursor.hash,
 		Timestamp:       time.Unix(s.redownloadCursor.timestamp+1, 0),
-		Bits:            s.nextExpectedNBits,
+		Bits:            expectedNextNBits(s),
 		ProofCommitment: chainhash.Hash{0x01},
 	}}
 }
@@ -259,7 +263,8 @@ func TestValidateAndStoreRedownloadedHeader(t *testing.T) {
 	t.Run("reject-bad-difficulty", func(t *testing.T) {
 		s := newRedownloadState(t)
 		hdr := buildValidRedownloadHeader(s)
-		if s.nextExpectedNBits == s.chainParams.PowLimitBits {
+		expected := expectedNextNBits(s)
+		if expected == s.chainParams.PowLimitBits {
 			hdr.BlockHeader.Bits = s.chainParams.PowLimitBits - 1
 		} else {
 			hdr.BlockHeader.Bits = s.chainParams.PowLimitBits
@@ -366,13 +371,13 @@ func TestSpotCheckBackpressure(t *testing.T) {
 		height: 100,
 		hash:   chainhash.Hash{0x01},
 	})
-	s.currentHeight = 100
+	s.tip.Height = 100
 	require.False(t, s.spotCheckBackpressured())
 
-	s.currentHeight = 100 + spotCheckMeanGap - 1
+	s.tip.Height = 100 + spotCheckMeanGap - 1
 	require.False(t, s.spotCheckBackpressured())
 
-	s.currentHeight = 100 + spotCheckMeanGap
+	s.tip.Height = 100 + spotCheckMeanGap
 	require.True(t, s.spotCheckBackpressured())
 
 	s.pendingSpotChecks = nil
@@ -436,9 +441,9 @@ func TestDoneRequiresFullDrain(t *testing.T) {
 
 func TestAbortReturnsTier2Hashes(t *testing.T) {
 	s := newRedownloadState(t)
-	s.tier2Expected = []approvedEntry{
-		{Hash: chainhash.Hash{0x01}},
-		{Hash: chainhash.Hash{0x02}},
+	s.tier2Expected = []chainhash.Hash{
+		{0x01},
+		{0x02},
 	}
 
 	hashes := s.Abort()

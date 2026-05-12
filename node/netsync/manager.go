@@ -821,22 +821,16 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 // --- presync helper functions ---
 
 // preValidateHeaders checks all continuity and context rules for a headers
-// batch (hash-chain, WTEMA difficulty, timestamp monotonicity). Returns the
-// ChainStartInfo for headers[0].PrevBlock, or (nil, nil) when the parent is
-// unknown.
-func (sm *SyncManager) preValidateHeaders(headers []wire.MsgHeader) (*blockchain.ChainStartInfo, error) {
-	prevHash := headers[0].BlockHeader.PrevBlock
-	chainStart := sm.chain.LookupChainStartInfo(&prevHash)
-	if chainStart == nil {
-		return nil, nil
-	}
-
+// batch (hash-chain, WTEMA difficulty, timestamp monotonicity) against the
+// provided chainStart.
+func (sm *SyncManager) preValidateHeaders(headers []wire.MsgHeader, chainStart *blockchain.ChainStartInfo) error {
+	prevHash := chainStart.Hash
 	parentHeight, parentBits := chainStart.Height, chainStart.Bits
 	parentTs, parentPrevTs := chainStart.Timestamp, chainStart.PrevTimestamp
 	for i := range headers {
 		header := &headers[i].BlockHeader
 		if header.PrevBlock != prevHash {
-			return chainStart, disconnectErr(
+			return disconnectErr(
 				"header %d PrevBlock mismatch: got %s, want %s",
 				i, header.PrevBlock, prevHash)
 		}
@@ -845,7 +839,7 @@ func (sm *SyncManager) preValidateHeaders(headers []wire.MsgHeader) (*blockchain
 			parentHeight, parentBits, parentTs, parentPrevTs,
 			blockchain.BFNone,
 		); err != nil {
-			return chainStart, banErr("header %d: %v", i, err)
+			return banErr("header %d: %v", i, err)
 		}
 		prevHash = header.BlockHash()
 		parentPrevTs = parentTs
@@ -853,7 +847,7 @@ func (sm *SyncManager) preValidateHeaders(headers []wire.MsgHeader) (*blockchain
 		parentBits = header.Bits
 		parentHeight++
 	}
-	return chainStart, nil
+	return nil
 }
 
 // startPresyncSession creates a new HeadersSyncState for a peer and feeds
@@ -1051,27 +1045,21 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) error {
 		return nil
 	}
 
-	// Validate headers: nBits format, intra-batch continuity, parent
-	// lookup, and full context checks (WTEMA difficulty, timestamp
-	// monotonicity). Returns the ChainStartInfo for the parent, or nil
-	// when the parent is unknown.
-	chainStart, err := sm.preValidateHeaders(msg.Headers)
-	if err != nil {
-		return err
+	// Active presync: the state machine validates everything internally.
+	if state.presync != nil {
+		return sm.feedPresync(peer, state, msg.Headers)
 	}
 
-	// Unknown parent: if presync is active the peer sent headers that
-	// don't continue from a known block -- abort. Otherwise ignore.
+	// Look up parent in block index; ignore if unknown.
+	prevHash := msg.Headers[0].BlockHeader.PrevBlock
+	chainStart := sm.chain.LookupChainStartInfo(&prevHash)
 	if chainStart == nil {
-		if state.presync != nil {
-			sm.cleanupPresync(peer, state)
-		}
 		return nil
 	}
 
-	// Active presync session: feed directly.
-	if state.presync != nil {
-		return sm.feedPresync(peer, state, msg.Headers)
+	// Validate continuity, WTEMA difficulty, and timestamp monotonicity.
+	if err := sm.preValidateHeaders(msg.Headers, chainStart); err != nil {
+		return err
 	}
 
 	// Evaluate whether presync is needed.
