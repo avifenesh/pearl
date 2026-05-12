@@ -106,6 +106,11 @@ func (msg *MsgHeaders) PrlDecode(r io.Reader, pver uint32, enc MessageEncoding) 
 		msg.Headers = append(msg.Headers, *mh)
 	}
 
+	if HasInconsistentCertificates(msg.Headers) {
+		return messageError("MsgHeaders.PrlDecode",
+			"headers batch mixes certified and uncertified headers")
+	}
+
 	return nil
 }
 

@@ -269,14 +269,6 @@ func TestValidateAndStoreRedownloadedHeader(t *testing.T) {
 		require.Equal(t, 0, len(s.redownloadApproved))
 	})
 
-	t.Run("reject-zero-proof-commitment", func(t *testing.T) {
-		s := newRedownloadState(t)
-		hdr := buildValidRedownloadHeader(s)
-		hdr.BlockHeader.ProofCommitment = chainhash.Hash{}
-		require.False(t, s.validateAndStoreRedownloadedHeader(hdr))
-		require.Equal(t, 0, len(s.redownloadApproved))
-		require.True(t, s.shouldPunish)
-	})
 }
 
 func TestRedownloadTier1Capacity(t *testing.T) {

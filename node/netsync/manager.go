@@ -54,7 +54,7 @@ const (
 
 	// headersResponseTime is the maximum time to wait for a headers
 	// response from a peer before considering a presync session stalled.
-	headersResponseTime = 2 * time.Minute
+	headersResponseTime = 30 * time.Second
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -820,35 +820,40 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 
 // --- presync helper functions ---
 
-// preValidateHeaders performs lightweight validation on a batch of headers
-// before feeding them to the presync state machine: nBits format and
-// intra-batch hash-chain continuity.
-func (sm *SyncManager) preValidateHeaders(headers []wire.MsgHeader) error {
-	for i := range headers {
-		if blockchain.CompactToBig(headers[i].BlockHeader.Bits).Sign() <= 0 {
-			return banErr("header %d has invalid nBits %x",
-				i, headers[i].BlockHeader.Bits)
-		}
+// preValidateHeaders checks all continuity and context rules for a headers
+// batch (hash-chain, WTEMA difficulty, timestamp monotonicity). Returns the
+// ChainStartInfo for headers[0].PrevBlock, or (nil, nil) when the parent is
+// unknown.
+func (sm *SyncManager) preValidateHeaders(headers []wire.MsgHeader) (*blockchain.ChainStartInfo, error) {
+	prevHash := headers[0].BlockHeader.PrevBlock
+	chainStart := sm.chain.LookupChainStartInfo(&prevHash)
+	if chainStart == nil {
+		return nil, nil
 	}
-	for i := 1; i < len(headers); i++ {
-		prevHash := headers[i-1].BlockHeader.BlockHash()
-		if headers[i].BlockHeader.PrevBlock != prevHash {
-			return disconnectErr(
-				"header %d PrevBlock mismatch: got %s, want %s",
-				i, headers[i].BlockHeader.PrevBlock, prevHash)
-		}
-	}
-	return nil
-}
 
-// calculateClaimedHeadersWork returns the cumulative work claimed by a
-// batch of headers (sum of CalcWork for each header's nBits).
-func calculateClaimedHeadersWork(headers []wire.MsgHeader) *big.Int {
-	total := new(big.Int)
+	parentHeight, parentBits := chainStart.Height, chainStart.Bits
+	parentTs, parentPrevTs := chainStart.Timestamp, chainStart.PrevTimestamp
 	for i := range headers {
-		total.Add(total, blockchain.CalcWork(headers[i].BlockHeader.Bits))
+		header := &headers[i].BlockHeader
+		if header.PrevBlock != prevHash {
+			return chainStart, disconnectErr(
+				"header %d PrevBlock mismatch: got %s, want %s",
+				i, header.PrevBlock, prevHash)
+		}
+		if err := blockchain.CheckBlockHeaderContextFromValues(
+			sm.chainParams, header,
+			parentHeight, parentBits, parentTs, parentPrevTs,
+			blockchain.BFNone,
+		); err != nil {
+			return chainStart, banErr("header %d: %v", i, err)
+		}
+		prevHash = header.BlockHash()
+		parentPrevTs = parentTs
+		parentTs = header.Timestamp.Unix()
+		parentBits = header.Bits
+		parentHeight++
 	}
-	return total
+	return chainStart, nil
 }
 
 // startPresyncSession creates a new HeadersSyncState for a peer and feeds
@@ -1007,7 +1012,8 @@ func (sm *SyncManager) handleRedownloadBlock(
 }
 
 // cleanupPresync aborts a presync session, clears Tier-2 block hashes
-// from the request maps, and marks the peer as low quality.
+// from the request maps, marks the peer as low quality, and records a
+// cooldown in recentlyFailedSync to prevent immediate re-entry.
 func (sm *SyncManager) cleanupPresync(peer *peerpkg.Peer, state *peerSyncState) {
 	if state.presync == nil {
 		return
@@ -1020,6 +1026,7 @@ func (sm *SyncManager) cleanupPresync(peer *peerpkg.Peer, state *peerSyncState) 
 	}
 	state.presync = nil
 	state.nonTipStrikes = lowQualityStrikeLimit
+	sm.recentlyFailedSync[peer.Addr()] = time.Now()
 	log.Infof("Presync with peer=%d (%s) aborted", peer.ID(), peer.Addr())
 }
 
@@ -1044,14 +1051,22 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) error {
 		return nil
 	}
 
-	// Lightweight validation: nBits format + intra-batch continuity.
-	if err := sm.preValidateHeaders(msg.Headers); err != nil {
+	// Validate headers: nBits format, intra-batch continuity, parent
+	// lookup, and full context checks (WTEMA difficulty, timestamp
+	// monotonicity). Returns the ChainStartInfo for the parent, or nil
+	// when the parent is unknown.
+	chainStart, err := sm.preValidateHeaders(msg.Headers)
+	if err != nil {
 		return err
 	}
 
-	// Reject mixed cert/cert-less batches.
-	if wire.HasInconsistentCertificates(msg.Headers) {
-		return banErr("peer %s sent headers with inconsistent certificates", peer.Addr())
+	// Unknown parent: if presync is active the peer sent headers that
+	// don't continue from a known block -- abort. Otherwise ignore.
+	if chainStart == nil {
+		if state.presync != nil {
+			sm.cleanupPresync(peer, state)
+		}
+		return nil
 	}
 
 	// Active presync session: feed directly.
@@ -1059,46 +1074,37 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) error {
 		return sm.feedPresync(peer, state, msg.Headers)
 	}
 
-	// Check whether we know the parent of the first header.
-	root := msg.Headers[0].BlockHeader.PrevBlock
-	chainStart := sm.chain.LookupChainStartInfo(&root)
-
-	// If parent is known, evaluate whether presync is needed.
-	if chainStart != nil {
-		threshold := sm.chain.GetAntiDoSWorkThreshold()
-		claimedWork := calculateClaimedHeadersWork(msg.Headers)
-		chainEndWork := new(big.Int).Add(chainStart.WorkSum, claimedWork)
-
-		fullBatch := numHeaders == wire.MaxBlockHeadersPerMsg
-		if chainEndWork.Cmp(threshold) < 0 && fullBatch {
-			return sm.startPresyncSession(peer, state, chainStart,
-				msg.Headers, threshold)
-		}
-	}
-
-	// Non-presync path: low-quality inv response. Request getdata only
-	// when parent is known and first header is new.
-	if chainStart != nil {
-		firstHash := msg.Headers[0].BlockHeader.BlockHash()
-		haveFirst, errFirst := sm.chain.HaveBlock(&firstHash)
-		if errFirst != nil || haveFirst {
+	// Evaluate whether presync is needed.
+	threshold := sm.chain.GetAntiDoSWorkThreshold()
+	if chainStart.WorkSum.Cmp(threshold) < 0 {
+		if t, ok := sm.recentlyFailedSync[peer.Addr()]; ok &&
+			time.Since(t) < syncPeerCooldown {
 			return nil
 		}
+		return sm.startPresyncSession(peer, state, chainStart,
+			msg.Headers, threshold)
+	}
 
-		gdmsg := wire.NewMsgGetData()
-		for i := range msg.Headers {
-			hash := msg.Headers[i].BlockHeader.BlockHash()
-			if _, exists := sm.requestedBlocks[hash]; exists {
-				continue
-			}
-			iv := wire.NewInvVect(wire.InvTypeWitnessBlock, &hash)
-			limitAdd(sm.requestedBlocks, hash, maxRequestedBlocks)
-			limitAdd(state.requestedBlocks, hash, maxRequestedBlocks)
-			gdmsg.AddInvVect(iv)
+	// Non-presync path: Request getdata when first header is new.
+	firstHash := msg.Headers[0].BlockHeader.BlockHash()
+	haveFirst, errFirst := sm.chain.HaveBlock(&firstHash)
+	if errFirst != nil || haveFirst {
+		return nil
+	}
+
+	gdmsg := wire.NewMsgGetData()
+	for i := range msg.Headers {
+		hash := msg.Headers[i].BlockHeader.BlockHash()
+		if _, exists := sm.requestedBlocks[hash]; exists {
+			continue
 		}
-		if len(gdmsg.InvList) > 0 {
-			peer.QueueMessage(gdmsg, nil)
-		}
+		iv := wire.NewInvVect(wire.InvTypeWitnessBlock, &hash)
+		limitAdd(sm.requestedBlocks, hash, maxRequestedBlocks)
+		limitAdd(state.requestedBlocks, hash, maxRequestedBlocks)
+		gdmsg.AddInvVect(iv)
+	}
+	if len(gdmsg.InvList) > 0 {
+		peer.QueueMessage(gdmsg, nil)
 	}
 
 	return nil

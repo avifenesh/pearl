@@ -586,10 +586,6 @@ func (s *HeadersSyncState) validateAndStoreCommitments(headers []wire.MsgHeader)
 	}
 
 	for i := range headers {
-		if s.currentChainWork.Cmp(s.minimumRequiredWork) >= 0 {
-			break
-		}
-
 		if !s.validateAndProcessSingleHeader(&headers[i]) {
 			return false
 		}
@@ -605,6 +601,10 @@ func (s *HeadersSyncState) validateAndStoreCommitments(headers []wire.MsgHeader)
 				prevBlock: hwc.BlockHeader.PrevBlock,
 			})
 			s.scheduleNextSpotCheck(s.currentHeight)
+		}
+
+		if s.currentChainWork.Cmp(s.minimumRequiredWork) >= 0 {
+			break
 		}
 	}
 
