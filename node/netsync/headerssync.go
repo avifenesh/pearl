@@ -322,13 +322,13 @@ func (s *HeadersSyncState) ProcessNextHeaders(
 					result.RequestMore = true
 				}
 				log.Infof("Headers presync with peer=%d: "+
-					"height=%d, commitments=%d, pending_checks=%d (presync)",
+					"height=%d, commitments=%d, pending_checks=%d",
 					s.peerID, s.currentHeight,
 					s.headerCommitments.Len(),
 					len(s.pendingSpotChecks))
 			default:
 				log.Infof("Headers presync aborted with peer=%d: "+
-					"incomplete message at height=%d (presync)", s.peerID, s.currentHeight)
+					"incomplete message at height=%d", s.peerID, s.currentHeight)
 			}
 		}
 
@@ -352,18 +352,18 @@ func (s *HeadersSyncState) ProcessNextHeaders(
 				if s.processAllRemainingHeaders {
 					s.redownloadShortBatchSeen = true
 					log.Infof("Headers presync complete with peer=%d: "+
-						"short batch at height=%d (redownload)",
+						"short batch at height=%d",
 						s.peerID, s.redownloadCursor.height)
 				} else {
 					log.Infof("Headers presync aborted with peer=%d: "+
-						"incomplete message at height=%d (redownload)",
+						"incomplete message at height=%d",
 						s.peerID, s.redownloadCursor.height)
 					result.Success = false
 				}
 			} else if s.hasRedownloadFifoCapacity() {
 				result.RequestMore = true
 				log.Infof("Headers redownload with peer=%d: "+
-					"height=%d, tier1=%d, commitments_left=%d (redownload)",
+					"height=%d, tier1=%d, commitments_left=%d",
 					s.peerID, s.redownloadCursor.height, len(s.redownloadApproved),
 					s.headerCommitments.Len())
 			}
@@ -486,10 +486,10 @@ func (s *HeadersSyncState) handleSpotCheckResponse(hwc wire.MsgHeader, scIdx int
 
 	if hwc.BlockCertificate() == nil {
 		log.Infof("Headers presync aborted with peer=%d: "+
-			"spot-check cert missing (presync)", s.peerID)
+			"spot-check cert missing", s.peerID)
 	} else if err := zkpow.VerifyCertificate(&hwc.BlockHeader, hwc.BlockCertificate()); err != nil {
 		log.Warnf("Headers presync aborted with peer=%d: "+
-			"spot-check cert invalid: %v (presync)", s.peerID, err)
+			"spot-check cert invalid: %v", s.peerID, err)
 		s.shouldPunish = true
 	} else {
 		if scIdx == 0 {
@@ -500,7 +500,7 @@ func (s *HeadersSyncState) handleSpotCheckResponse(hwc wire.MsgHeader, scIdx int
 		result.Success = true
 
 		log.Infof("Headers presync spot-check passed with peer=%d: "+
-			"height=%d, pending=%d (presync)",
+			"height=%d, pending=%d",
 			s.peerID, scHeight, len(s.pendingSpotChecks))
 
 		if s.currentChainWork.Cmp(s.minimumRequiredWork) >= 0 &&
@@ -581,7 +581,7 @@ func (s *HeadersSyncState) validateAndStoreCommitments(headers []wire.MsgHeader)
 
 	if headers[0].BlockHeader.PrevBlock != s.lastHeaderHash {
 		log.Infof("Headers presync aborted with peer=%d: "+
-			"non-continuous at height=%d (presync)", s.peerID, s.currentHeight)
+			"non-continuous at height=%d", s.peerID, s.currentHeight)
 		return false
 	}
 
@@ -633,14 +633,6 @@ func (s *HeadersSyncState) validateAndProcessSingleHeader(hwc *wire.MsgHeader) b
 		return false
 	}
 
-	var zeroHash chainhash.Hash
-	if header.ProofCommitment == zeroHash {
-		log.Warnf("Headers presync aborted with peer=%d: "+
-			"zero ProofCommitment at height=%d (presync)", s.peerID, nextHeight)
-		s.shouldPunish = true
-		return false
-	}
-
 	// Checkpoint enforcement.
 	headerHash := header.BlockHash()
 	if !s.verifyCheckpoint(nextHeight, &headerHash) {
@@ -680,14 +672,6 @@ func (s *HeadersSyncState) validateAndStoreRedownloadedHeader(hwc *wire.MsgHeade
 		return false
 	}
 
-	var zeroHash chainhash.Hash
-	if header.ProofCommitment == zeroHash {
-		log.Warnf("Headers presync aborted with peer=%d: "+
-			"zero ProofCommitment at height=%d (redownload)", s.peerID, nextHeight)
-		s.shouldPunish = true
-		return false
-	}
-
 	// Checkpoint enforcement.
 	headerHash := header.BlockHash()
 	if !s.verifyCheckpoint(nextHeight, &headerHash) {
@@ -696,15 +680,15 @@ func (s *HeadersSyncState) validateAndStoreRedownloadedHeader(hwc *wire.MsgHeade
 
 	if !s.processAllRemainingHeaders {
 		if s.headerCommitments.Empty() {
-			log.Infof("Headers presync aborted with peer=%d: "+
-				"commitment overrun at height=%d (redownload)", s.peerID, nextHeight)
+			log.Infof("Headers redownload aborted with peer=%d: "+
+				"commitment overrun at height=%d", s.peerID, nextHeight)
 			return false
 		}
 		bit := s.commitBit(headerHash)
 		expected := s.headerCommitments.PopFront()
 		if bit != expected {
-			log.Infof("Headers presync aborted with peer=%d: "+
-				"commitment mismatch at height=%d (redownload)", s.peerID, nextHeight)
+			log.Infof("Headers redownload aborted with peer=%d: "+
+				"commitment mismatch at height=%d", s.peerID, nextHeight)
 			return false
 		}
 	}
@@ -747,8 +731,8 @@ func (s *HeadersSyncState) checkHeaderTransition(
 	nextHeight := parentHeight + 1
 
 	if prevHash != nil && header.PrevBlock != *prevHash {
-		log.Infof("Headers presync aborted with peer=%d: "+
-			"non-continuous at height=%d (%s)", s.peerID, nextHeight, phaseName)
+		log.Infof("Headers %s aborted with peer=%d: "+
+			"non-continuous at height=%d", phaseName, s.peerID, nextHeight)
 		return false
 	}
 
@@ -757,8 +741,8 @@ func (s *HeadersSyncState) checkHeaderTransition(
 		parentHeight, parentBits, parentTs, parentPrevTs,
 		blockchain.BFNone,
 	); err != nil {
-		log.Warnf("Headers presync aborted with peer=%d: "+
-			"%v at height=%d (%s)", s.peerID, err, nextHeight, phaseName)
+		log.Warnf("Headers %s aborted with peer=%d: "+
+			"%v at height=%d", phaseName, s.peerID, err, nextHeight)
 		s.shouldPunish = true
 		return false
 	}
@@ -776,15 +760,15 @@ func (s *HeadersSyncState) verifyCheckpoint(nextHeight int32, headerHash *chainh
 		return true
 	}
 	if !headerHash.IsEqual(cp.Hash) {
-		log.Warnf("Headers presync aborted with peer=%d: "+
-			"checkpoint mismatch at height=%d (%s)",
-			s.peerID, nextHeight, s.phase.String())
+		log.Warnf("Headers %s aborted with peer=%d: "+
+			"checkpoint mismatch at height=%d",
+			s.phase.String(), s.peerID, nextHeight)
 		s.shouldPunish = true
 		return false
 	}
 	s.nextCpIdx++
-	log.Infof("Verified presync header against checkpoint at height %d",
-		nextHeight)
+	log.Infof("Headers %s checkpoint passed with peer=%d at height %d",
+		s.phase.String(), s.peerID, nextHeight)
 	return true
 }
 

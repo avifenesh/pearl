@@ -146,7 +146,6 @@ type pauseMsg struct {
 	unpause <-chan struct{}
 }
 
-
 // peerSyncState stores additional information that the SyncManager tracks
 // about a peer.
 type peerSyncState struct {
@@ -915,7 +914,7 @@ func (sm *SyncManager) feedPresync(
 
 	// Check if presync is fully done.
 	if state.presync.Done() {
-		log.Infof("Presync with peer %s completed successfully", peer.Addr())
+		log.Infof("Presync with peer=%d (%s) completed successfully", peer.ID(), peer.Addr())
 		state.presync = nil
 	}
 
@@ -965,8 +964,8 @@ func (sm *SyncManager) handleRedownloadBlock(
 		_, _, err := sm.chain.ProcessBlock(readyBlock, blockchain.BFNoAntiDoSWork)
 		if err != nil {
 			if _, ok := err.(blockchain.RuleError); ok {
-				log.Infof("Presync rejected block %v from %s: %v",
-					readyBlock.Hash(), peer, err)
+				log.Infof("Presync rejected block %v from peer=%d (%s): %v",
+					readyBlock.Hash(), peer.ID(), peer.Addr(), err)
 			} else {
 				log.Errorf("Presync failed to process block %v: %v",
 					readyBlock.Hash(), err)
@@ -979,6 +978,9 @@ func (sm *SyncManager) handleRedownloadBlock(
 			return err
 		}
 		sm.progressLogger.LogBlockHeight(readyBlock, sm.chain)
+		if peer == sm.syncPeer {
+			sm.lastProgressTime = time.Now()
+		}
 	}
 
 	// Drive more getdata from Tier-1 -> Tier-2.
@@ -993,7 +995,7 @@ func (sm *SyncManager) handleRedownloadBlock(
 	}
 
 	if state.presync.Done() {
-		log.Infof("Presync with peer %s completed successfully", peer.Addr())
+		log.Infof("Presync with peer=%d (%s) completed successfully", peer.ID(), peer.Addr())
 		state.presync = nil
 
 		if err := sm.chain.FlushUtxoCache(blockchain.FlushPeriodic); err != nil {
@@ -1018,7 +1020,7 @@ func (sm *SyncManager) cleanupPresync(peer *peerpkg.Peer, state *peerSyncState) 
 	}
 	state.presync = nil
 	state.nonTipStrikes = lowQualityStrikeLimit
-	log.Infof("Presync with peer %s aborted", peer.Addr())
+	log.Infof("Presync with peer=%d (%s) aborted", peer.ID(), peer.Addr())
 }
 
 // handleHeadersMsg handles a headers message. Returns an error when the
