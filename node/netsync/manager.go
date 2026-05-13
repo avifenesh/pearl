@@ -1037,17 +1037,13 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) error {
 	msg := hmsg.headers
 	numHeaders := len(msg.Headers)
 
-	// Empty batch: abort any active presync (peer stopped cooperating).
-	if numHeaders == 0 {
-		if state.presync != nil {
-			sm.cleanupPresync(peer, state)
-		}
-		return nil
-	}
-
 	// Active presync: the state machine validates everything internally.
 	if state.presync != nil {
 		return sm.feedPresync(peer, state, msg.Headers)
+	}
+
+	if numHeaders == 0 {
+		return nil
 	}
 
 	// Look up parent in block index; ignore if unknown.
@@ -1073,15 +1069,22 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) error {
 			msg.Headers, threshold)
 	}
 
-	// Non-presync path: Request getdata when first header is new.
-	firstHash := msg.Headers[0].BlockHeader.BlockHash()
-	haveFirst, errFirst := sm.chain.HaveBlock(&firstHash)
-	if errFirst != nil || haveFirst {
+	// Scan backward to find the first header not yet in the block index.
+	firstNew := numHeaders
+	for firstNew >= 1 {
+		hash := msg.Headers[firstNew-1].BlockHeader.BlockHash()
+		have, err := sm.chain.HaveBlock(&hash)
+		if err != nil || have {
+			break
+		}
+		firstNew--
+	}
+	if firstNew >= numHeaders {
 		return nil
 	}
 
 	gdmsg := wire.NewMsgGetData()
-	for i := range msg.Headers {
+	for i := firstNew; i < numHeaders; i++ {
 		hash := msg.Headers[i].BlockHeader.BlockHash()
 		if _, exists := sm.requestedBlocks[hash]; exists {
 			continue
