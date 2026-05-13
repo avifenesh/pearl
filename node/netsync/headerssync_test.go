@@ -188,7 +188,6 @@ func TestCommitBitSipHashKnownVector(t *testing.T) {
 
 // --- Hash accessors ---
 
-
 func TestShouldSpotCheckByWorkHighProb(t *testing.T) {
 	params := makeTestParams()
 	start := makeChainStart(100)

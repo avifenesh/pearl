@@ -352,9 +352,6 @@ func (s *HeadersSyncState) ProcessNextHeaders(
 
 	if !result.Success && s.phase != PhaseRedownload {
 		s.finalize()
-	} else if result.Success && s.phase != PhaseRedownload && !result.RequestMore &&
-		!s.presyncWorkSufficient() {
-		s.finalize()
 	}
 
 	if result.RequestMore {

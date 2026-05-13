@@ -480,6 +480,13 @@ func (sm *SyncManager) handleStallSample() {
 			sm.cleanupPresync(peer, st)
 		}
 	}
+
+	// Evict expired entries from the failed-sync cooldown map.
+	for addr, t := range sm.recentlyFailedSync {
+		if now.Sub(t) >= syncPeerCooldown {
+			delete(sm.recentlyFailedSync, addr)
+		}
+	}
 }
 
 // shouldDCStalledSyncPeer determines whether or not we should disconnect a
@@ -893,6 +900,10 @@ func (sm *SyncManager) feedPresync(
 	if !result.Success {
 		sm.cleanupPresync(peer, state)
 		return nil
+	}
+
+	if peer == sm.syncPeer {
+		sm.lastProgressTime = time.Now()
 	}
 
 	// Send spot-check getheaders.
