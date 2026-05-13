@@ -993,7 +993,10 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	msg := hmsg.headers
 	numHeaders := len(msg.Headers)
 
-	// Nothing to do for an empty headers message.
+	// Nothing to do for an empty headers message. In non-headers-first
+	// mode the peer may be replying to a getheaders probe we sent after
+	// an inv; an empty response is legitimate (e.g. our tip advanced
+	// between probe and reply) and cheap on both sides, so no penalty is applied.
 	if numHeaders == 0 {
 		return
 	}
