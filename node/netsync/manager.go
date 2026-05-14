@@ -714,7 +714,15 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 
 	// Process the block to include validation, best chain selection, orphan
 	// handling, etc.
-	_, isOrphan, err := sm.chain.ProcessBlock(bmsg.block, blockchain.BFNone)
+	isMainChain, isOrphan, err := sm.chain.ProcessBlock(bmsg.block, blockchain.BFNone)
+
+	// Strike accounting: a single decision point based on ProcessBlock's
+	// result rather than re-deriving it from chain state.
+	if isMainChain {
+		state.nonTipStrikes = 0
+	} else if ruleErr, ok := err.(blockchain.RuleError); !ok || ruleErr.ErrorCode != blockchain.ErrDuplicateBlock {
+		state.strikeNonTip()
+	}
 	if err != nil {
 		// When the error is a rule error, it means the block was simply
 		// rejected as opposed to something actually going wrong, so log
@@ -731,8 +739,6 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 			database.ErrCorruption {
 			panic(dbErr)
 		}
-
-		state.strikeNonTip()
 
 		// Convert the error into an appropriate reject message and
 		// send it.
@@ -770,8 +776,6 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 			blkHashUpdate = blockHash
 		}
 
-		state.strikeNonTip()
-
 		orphanRoot := sm.chain.GetOrphanRoot(blockHash)
 		locator, err := sm.chain.LatestBlockLocator()
 		if err != nil {
@@ -794,14 +798,6 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 		best := sm.chain.BestSnapshot()
 		heightUpdate = best.Height
 		blkHashUpdate = &best.Hash
-
-		// Only a tip-extending block resets strikes; accepted-but-
-		// not-tip blocks drift the peer toward low quality.
-		if best.Hash == *blockHash {
-			state.nonTipStrikes = 0
-		} else {
-			state.strikeNonTip()
-		}
 
 		// Clear the rejected transactions.
 		sm.rejectedTxns = make(map[chainhash.Hash]struct{})
@@ -1055,6 +1051,11 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) error {
 
 	if numHeaders == 0 {
 		return nil
+	}
+
+	// Outside presync stage, disconnect for cert-bearing messages.
+	if msg.Headers[0].BlockCertificate() != nil {
+		return disconnectErr("peer sent certificate-bearing headers outside presync stage")
 	}
 
 	// Look up parent in block index; ignore if unknown.
