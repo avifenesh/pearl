@@ -171,14 +171,6 @@ func isPeerHighQuality(state *peerSyncState) bool {
 	return state.nonTipStrikes < lowQualityStrikeLimit
 }
 
-// strikeNonTip records that a block from this peer did not extend
-// our tip (orphan, rejected, or accepted on a side chain).
-func (s *peerSyncState) strikeNonTip() {
-	if s.nonTipStrikes < lowQualityStrikeLimit {
-		s.nonTipStrikes++
-	}
-}
-
 // limitAdd is a helper function for maps that require a maximum limit by
 // evicting a random value if adding the new value would cause it to
 // overflow the maximum allowed.
@@ -721,7 +713,9 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 	if isMainChain {
 		state.nonTipStrikes = 0
 	} else if ruleErr, ok := err.(blockchain.RuleError); !ok || ruleErr.ErrorCode != blockchain.ErrDuplicateBlock {
-		state.strikeNonTip()
+		if state.nonTipStrikes < lowQualityStrikeLimit {
+			state.nonTipStrikes++
+		}
 	}
 	if err != nil {
 		// When the error is a rule error, it means the block was simply

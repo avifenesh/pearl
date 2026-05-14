@@ -280,6 +280,16 @@ func (s *HeadersSyncState) ProcessNextHeaders(
 		}
 	}
 
+	// For non-spot-check responses, any certificates are a protocol violation.
+	if headers[0].BlockCertificate() != nil {
+		log.Warnf("Headers presync aborted with peer=%d: unexpected "+
+			"certificate-bearing headers", s.peerID)
+		s.shouldPunish = true
+		result.ShouldPunish = true
+		s.finalize()
+		return result
+	}
+
 	switch s.phase {
 	case PhasePresync:
 		prevPending := len(s.pendingSpotChecks)
