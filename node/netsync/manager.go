@@ -322,64 +322,81 @@ func (sm *SyncManager) startSync() {
 		return
 	}
 
-	best := sm.chain.BestSnapshot()
 	bestPeer := sm.pickSyncCandidate()
+	if bestPeer == nil {
+		log.Warnf("No sync peer candidates available")
+		return
+	}
 
-	// Start syncing from the best peer if one was selected.
-	if bestPeer != nil {
-		// Clear the requestedBlocks if the sync peer changes, otherwise
-		// we may ignore blocks we need that the last sync peer failed
-		// to send.
-		sm.requestedBlocks = make(map[chainhash.Hash]struct{})
+	best := sm.chain.BestSnapshot()
 
-		locator, err := sm.chain.LatestBlockLocator()
-		if err != nil {
-			log.Errorf("Failed to get block locator for the "+
-				"latest block: %v", err)
+	// Skip peers that have nothing new to offer. If the peer announced
+	// a block we already have, skip it. Otherwise fall back to the
+	// version-message height: a peer at or below our height is skipped.
+	if announced := bestPeer.LastAnnouncedBlock(); announced != nil {
+		if have, _ := sm.chain.HaveBlock(announced); have {
+			log.Debugf("Skipping sync: candidate %s only "+
+				"announced blocks we already have",
+				bestPeer.Addr())
 			return
 		}
-
-		log.Infof("Syncing to block height %d from peer %v",
-			bestPeer.LastBlock(), bestPeer.Addr())
-
-		// When the current height is less than a known checkpoint we
-		// can use block headers to learn about which blocks comprise
-		// the chain up to the checkpoint and perform less validation
-		// for them.  This is possible since each header contains the
-		// hash of the previous header and a merkle root.  Therefore if
-		// we validate all of the received headers link together
-		// properly and the checkpoint hashes match, we can be sure the
-		// hashes for the blocks in between are accurate.  Further, once
-		// the full blocks are downloaded, the merkle root is computed
-		// and compared against the value in the header which proves the
-		// full block hasn't been tampered with.
-		//
-		// Once we have passed the final checkpoint, or checkpoints are
-		// disabled, use standard inv messages learn about the blocks
-		// and fully validate them.  Finally, regression test mode does
-		// not support the headers-first approach so do normal block
-		// downloads when in regression test mode.
-		if sm.nextCheckpoint != nil &&
-			best.Height < sm.nextCheckpoint.Height &&
-			sm.chainParams != &chaincfg.RegressionNetParams {
-
-			bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash)
-			sm.headersFirstMode = true
-			log.Infof("Downloading headers for blocks %d to "+
-				"%d from peer %s", best.Height+1,
-				sm.nextCheckpoint.Height, bestPeer.Addr())
-		} else {
-			bestPeer.PushGetBlocksMsg(locator, &zeroHash)
-		}
-		sm.syncPeer = bestPeer
-
-		// Reset the last progress time now that we have a non-nil
-		// syncPeer to avoid instantly detecting it as stalled in the
-		// event the progress time hasn't been updated recently.
-		sm.lastProgressTime = time.Now()
-	} else {
-		log.Warnf("No sync peer candidates available")
+	} else if bestPeer.LastBlock() <= best.Height {
+		log.Debugf("Skipping sync: candidate %s advertises "+
+			"height %d, our best is %d",
+			bestPeer.Addr(), bestPeer.LastBlock(), best.Height)
+		return
 	}
+
+	// Clear the requestedBlocks if the sync peer changes, otherwise
+	// we may ignore blocks we need that the last sync peer failed
+	// to send.
+	sm.requestedBlocks = make(map[chainhash.Hash]struct{})
+
+	locator, err := sm.chain.LatestBlockLocator()
+	if err != nil {
+		log.Errorf("Failed to get block locator for the "+
+			"latest block: %v", err)
+		return
+	}
+
+	log.Infof("Syncing to block height %d from peer %v",
+		bestPeer.LastBlock(), bestPeer.Addr())
+
+	// When the current height is less than a known checkpoint we
+	// can use block headers to learn about which blocks comprise
+	// the chain up to the checkpoint and perform less validation
+	// for them.  This is possible since each header contains the
+	// hash of the previous header and a merkle root.  Therefore if
+	// we validate all of the received headers link together
+	// properly and the checkpoint hashes match, we can be sure the
+	// hashes for the blocks in between are accurate.  Further, once
+	// the full blocks are downloaded, the merkle root is computed
+	// and compared against the value in the header which proves the
+	// full block hasn't been tampered with.
+	//
+	// Once we have passed the final checkpoint, or checkpoints are
+	// disabled, use standard inv messages learn about the blocks
+	// and fully validate them.  Finally, regression test mode does
+	// not support the headers-first approach so do normal block
+	// downloads when in regression test mode.
+	if sm.nextCheckpoint != nil &&
+		best.Height < sm.nextCheckpoint.Height &&
+		sm.chainParams != &chaincfg.RegressionNetParams {
+
+		bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash)
+		sm.headersFirstMode = true
+		log.Infof("Downloading headers for blocks %d to "+
+			"%d from peer %s", best.Height+1,
+			sm.nextCheckpoint.Height, bestPeer.Addr())
+	} else {
+		bestPeer.PushGetBlocksMsg(locator, &zeroHash)
+	}
+	sm.syncPeer = bestPeer
+
+	// Reset the last progress time now that we have a non-nil
+	// syncPeer to avoid instantly detecting it as stalled in the
+	// event the progress time hasn't been updated recently.
+	sm.lastProgressTime = time.Now()
 }
 
 // isSyncCandidate returns whether or not the peer is a candidate to consider
@@ -963,6 +980,13 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
+	// Only the sync peer may drive the headers-first state machine;
+	// other peers' headers can race sm.headerList and break linkage for
+	// the sync peer's legitimate batches.
+	if peer != sm.syncPeer {
+		return
+	}
+
 	// Nothing to do for an empty headers message.
 	if numHeaders == 0 {
 		return
@@ -976,6 +1000,18 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		blockHeader := &msgHeader.BlockHeader
 		blockHash := blockHeader.BlockHash()
 		finalHash = &blockHash
+
+		// Verify proof of work and certificate per header. getheaders
+		// always requests certificates, so a missing or invalid one
+		// is a protocol violation.
+		if err := sm.chain.CheckHeaderSanity(
+			blockHeader, msgHeader.BlockCertificate(),
+		); err != nil {
+			log.Warnf("Header from peer %s failed sanity check: "+
+				"%v -- disconnecting", peer.Addr(), err)
+			peer.Disconnect()
+			return
+		}
 
 		// Ensure there is a previous header to compare against.
 		prevNodeEl := sm.headerList.Back()
@@ -1023,6 +1059,16 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			}
 			break
 		}
+	}
+
+	// Tick the stall clock only for full batches or the final batch that
+	// reaches the next checkpoint. The producer always fills batches to
+	// MaxBlockHeadersPerMsg until it runs into a stop condition, so an
+	// undersized non-final batch is the producer's signal that no real
+	// progress remains -- a peer trickling small batches to extend the
+	// stall window earns no credit and gets rotated by the stall handler.
+	if numHeaders == wire.MaxBlockHeadersPerMsg || receivedCheckpoint {
+		sm.lastProgressTime = time.Now()
 	}
 
 	// When this header is a checkpoint, switch to fetching the blocks for
