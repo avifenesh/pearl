@@ -1006,6 +1006,13 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// unbroken parent chain rooted at headers[0].PrevBlock and that
 	// root is already known to us.
 	if !sm.headersFirstMode {
+		if msg.Headers[0].BlockCertificate() != nil {
+			log.Warnf("Peer %s sent certificate-bearing headers outside "+
+				"headersFirst mode -- disconnecting", peer.Addr())
+			peer.Disconnect()
+			return
+		}
+
 		root := msg.Headers[0].BlockHeader.PrevBlock
 		havePrev, errPrev := sm.chain.HaveBlock(&root)
 		if errPrev != nil || !havePrev {
