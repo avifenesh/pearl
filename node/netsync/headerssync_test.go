@@ -69,7 +69,7 @@ func TestProcessNextHeadersEmptyReturnsFailure(t *testing.T) {
 
 	s := NewHeadersSyncState(1, "", params, start, minWork)
 
-	result := s.ProcessNextHeaders(nil, true)
+	result := s.ProcessNextHeaders(nil, nil, true)
 	require.False(t, result.Success)
 	require.False(t, result.RequestMore)
 }
@@ -85,7 +85,7 @@ func TestProcessNextHeadersFinalState(t *testing.T) {
 	require.Equal(t, PhaseFinal, s.Phase())
 	require.True(t, s.Done())
 
-	result := s.ProcessNextHeaders([]wire.MsgHeader{{
+	result := s.ProcessNextHeaders(nil, []wire.MsgHeader{{
 		BlockHeader: wire.BlockHeader{},
 	}}, true)
 	require.False(t, result.Success)
@@ -454,7 +454,7 @@ func TestLastProgressTimeUpdated(t *testing.T) {
 	s := NewHeadersSyncState(1, "", makeTestParams(), makeChainStart(100), big.NewInt(5000))
 	before := s.LastProgressTime()
 	time.Sleep(time.Millisecond)
-	s.ProcessNextHeaders(nil, true) // empty = no success, but still updates progress
+	s.ProcessNextHeaders(nil, nil, true) // empty = no success, but still updates progress
 	require.True(t, s.LastProgressTime().After(before) || s.LastProgressTime().Equal(before))
 }
 

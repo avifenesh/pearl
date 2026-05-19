@@ -313,13 +313,14 @@ func (sm *SyncManager) startSync() {
 		// a single peer. The initial getheaders uses zeroHash so the
 		// response triggers presync creation in handleHeadersMsg.
 		// Regression test mode uses direct block download instead.
-		if !sm.current() &&
-			sm.chainParams != &chaincfg.RegressionNetParams {
+		if sm.chainParams != &chaincfg.RegressionNetParams {
 
 			bestPeer.PushGetHeadersMsg(locator, &zeroHash, false)
-			sm.headersFirstMode = true
-			log.Infof("Starting headers-first presync from peer %s",
-				bestPeer.Addr())
+			if !sm.current() {
+				sm.headersFirstMode = true
+				log.Infof("Starting headers-first presync from peer %s",
+					bestPeer.Addr())
+			}
 		} else {
 			bestPeer.PushGetBlocksMsg(locator, &zeroHash)
 		}
@@ -469,7 +470,7 @@ func (sm *SyncManager) handleStallSample() {
 		if st.presync != nil &&
 			now.Sub(st.presync.LastProgressTime()) > headersResponseTime {
 			log.Infof("Presync with peer %s stalled, aborting", peer.Addr())
-			sm.cleanupPresync(peer, st)
+			sm.abortPresync(peer, st)
 		}
 	}
 
@@ -520,7 +521,7 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 	log.Infof("Lost peer %s", peer)
 
 	if state.presync != nil {
-		sm.cleanupPresync(peer, state)
+		sm.abortPresync(peer, state)
 	}
 
 	sm.clearRequestedState(state)
@@ -817,46 +818,24 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 
 // --- presync helper functions ---
 
-// preValidateHeaders checks all continuity and context rules for a headers
-// batch (hash-chain, WTEMA difficulty, timestamp monotonicity) against the
-// provided chainStart.
-func (sm *SyncManager) preValidateHeaders(headers []wire.MsgHeader, chainStart *blockchain.ChainStartInfo) error {
-	prevHash := chainStart.Hash
-	parentHeight, parentBits := chainStart.Height, chainStart.Bits
-	parentTs, parentPrevTs := chainStart.Timestamp, chainStart.PrevTimestamp
-	for i := range headers {
-		header := &headers[i].BlockHeader
-		if header.PrevBlock != prevHash {
-			return disconnectErr(
-				"header %d PrevBlock mismatch: got %s, want %s",
-				i, header.PrevBlock, prevHash)
-		}
-		if err := blockchain.CheckBlockHeaderContextFromValues(
-			sm.chainParams, header,
-			parentHeight, parentBits, parentTs, parentPrevTs,
-			blockchain.BFNone,
-		); err != nil {
-			return banErr("header %d: %v", i, err)
-		}
-		prevHash = header.BlockHash()
-		parentPrevTs = parentTs
-		parentTs = header.Timestamp.Unix()
-		parentBits = header.Bits
-		parentHeight++
+// clearPresyncState nils the presync session and, if the peer is the
+// current sync peer, clears headersFirstMode so inv messages are
+// accepted again.
+func (sm *SyncManager) clearPresyncState(peer *peerpkg.Peer, state *peerSyncState) {
+	state.presync = nil
+	if peer == sm.syncPeer {
+		sm.headersFirstMode = false
 	}
-	return nil
 }
 
-// startPresyncSession creates a new HeadersSyncState for a peer and feeds
-// the first batch of headers into it. Returns an error suitable for
-// onPeerVerdict if the peer should be punished.
+// startPresyncSession creates a new HeadersSyncState for a peer.
+// The caller is responsible for calling feedPresync afterwards.
 func (sm *SyncManager) startPresyncSession(
 	peer *peerpkg.Peer,
 	state *peerSyncState,
 	start *blockchain.ChainStartInfo,
-	headers []wire.MsgHeader,
 	threshold *big.Int,
-) error {
+) {
 	locator := sm.chain.BlockLocatorFromHash(&start.Hash)
 	csInfo := chainStartInfo{
 		ChainStartInfo: *start,
@@ -866,30 +845,36 @@ func (sm *SyncManager) startPresyncSession(
 	state.presync = NewHeadersSyncState(
 		peer.ID(), peer.Addr(), sm.chainParams, csInfo, threshold,
 	)
-
-	return sm.feedPresync(peer, state, headers)
 }
 
 // feedPresync routes a batch of headers through the active presync session,
 // interprets the result (spot-check requests, getdata, done), and returns
-// an error if the peer should be punished.
+// an error if the peer should be punished. When firstFeed is true and presync
+// transitions to redownload within this batch, the same headers are
+// re-processed as redownload entries to save a network round-trip.
 func (sm *SyncManager) feedPresync(
 	peer *peerpkg.Peer,
 	state *peerSyncState,
 	headers []wire.MsgHeader,
+	firstFeed bool,
 ) error {
 	fullMessage := len(headers) == wire.MaxBlockHeadersPerMsg
 
-	result := state.presync.ProcessNextHeaders(headers, fullMessage)
-
-	if result.ShouldPunish {
-		sm.cleanupPresync(peer, state)
-		return banErr("presync punish: peer %s sent invalid data", peer.Addr())
+	abortOnFailure := func(result HeadersSyncResult) (error, bool) {
+		if result.ShouldPunish {
+			sm.abortPresync(peer, state)
+			return banErr("presync punish: peer %s sent invalid data", peer.Addr()), true
+		}
+		if !result.Success {
+			sm.abortPresync(peer, state)
+			return nil, true
+		}
+		return nil, false
 	}
 
-	if !result.Success {
-		sm.cleanupPresync(peer, state)
-		return nil
+	result := state.presync.ProcessNextHeaders(sm.chain, headers, fullMessage)
+	if err, done := abortOnFailure(result); done {
+		return err
 	}
 
 	if peer == sm.syncPeer {
@@ -899,6 +884,16 @@ func (sm *SyncManager) feedPresync(
 	// Send spot-check getheaders.
 	for _, sc := range result.SpotCheckRequests {
 		_ = peer.PushGetHeadersMsg(sc.Locator, &sc.StopHash, true)
+	}
+
+	// On the very first feed after session creation, if presync
+	// transitioned to redownload, re-process the same headers as
+	// redownload entries to save a network round-trip.
+	if firstFeed && state.presync.Phase() == PhaseRedownload {
+		result = state.presync.ProcessNextHeaders(sm.chain, headers, fullMessage)
+		if err, done := abortOnFailure(result); done {
+			return err
+		}
 	}
 
 	// If we transitioned to REDOWNLOAD or are in REDOWNLOAD, drive getdata.
@@ -915,7 +910,7 @@ func (sm *SyncManager) feedPresync(
 	// Check if presync is fully done.
 	if state.presync.Done() {
 		log.Infof("Presync with peer=%d (%s) completed successfully", peer.ID(), peer.Addr())
-		state.presync = nil
+		sm.clearPresyncState(peer, state)
 	}
 
 	return nil
@@ -956,7 +951,7 @@ func (sm *SyncManager) handleRedownloadBlock(
 	result := state.presync.BlockArrived(blockHash, block)
 
 	if result.Mismatch {
-		sm.cleanupPresync(peer, state)
+		sm.abortPresync(peer, state)
 		return banErr("presync redownload: block %s hash mismatch", blockHash)
 	}
 
@@ -974,7 +969,7 @@ func (sm *SyncManager) handleRedownloadBlock(
 				database.ErrCorruption {
 				panic(dbErr)
 			}
-			sm.cleanupPresync(peer, state)
+			sm.abortPresync(peer, state)
 			return err
 		}
 		sm.progressLogger.LogBlockHeight(readyBlock, sm.chain)
@@ -996,7 +991,7 @@ func (sm *SyncManager) handleRedownloadBlock(
 
 	if state.presync.Done() {
 		log.Infof("Presync with peer=%d (%s) completed successfully", peer.ID(), peer.Addr())
-		state.presync = nil
+		sm.clearPresyncState(peer, state)
 
 		if err := sm.chain.FlushUtxoCache(blockchain.FlushPeriodic); err != nil {
 			log.Errorf("Error while flushing the blockchain cache: %v", err)
@@ -1006,10 +1001,10 @@ func (sm *SyncManager) handleRedownloadBlock(
 	return nil
 }
 
-// cleanupPresync aborts a presync session, clears Tier-2 block hashes
+// abortPresync aborts a presync session, clears Tier-2 block hashes
 // from the request maps, marks the peer as low quality, and records a
 // cooldown in recentlyFailedSync to prevent immediate re-entry.
-func (sm *SyncManager) cleanupPresync(peer *peerpkg.Peer, state *peerSyncState) {
+func (sm *SyncManager) abortPresync(peer *peerpkg.Peer, state *peerSyncState) {
 	if state.presync == nil {
 		return
 	}
@@ -1019,7 +1014,7 @@ func (sm *SyncManager) cleanupPresync(peer *peerpkg.Peer, state *peerSyncState) 
 		delete(state.requestedBlocks, h)
 		delete(sm.requestedBlocks, h)
 	}
-	state.presync = nil
+	sm.clearPresyncState(peer, state)
 	state.nonTipStrikes = lowQualityStrikeLimit
 	sm.recentlyFailedSync[peer.Addr()] = time.Now()
 	log.Infof("Presync with peer=%d (%s) aborted", peer.ID(), peer.Addr())
@@ -1040,16 +1035,11 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) error {
 
 	// Active presync: the state machine validates everything internally.
 	if state.presync != nil {
-		return sm.feedPresync(peer, state, msg.Headers)
+		return sm.feedPresync(peer, state, msg.Headers, false)
 	}
 
 	if numHeaders == 0 {
 		return nil
-	}
-
-	// Outside presync stage, disconnect for cert-bearing messages.
-	if msg.Headers[0].BlockCertificate() != nil {
-		return disconnectErr("peer sent certificate-bearing headers outside presync stage")
 	}
 
 	// Look up parent in block index; ignore if unknown.
@@ -1059,52 +1049,13 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) error {
 		return nil
 	}
 
-	// Validate continuity, WTEMA difficulty, and timestamp monotonicity.
-	if err := sm.preValidateHeaders(msg.Headers, chainStart); err != nil {
-		return err
-	}
-
-	// Evaluate whether presync is needed.
 	threshold := sm.chain.GetAntiDoSWorkThreshold()
-	if chainStart.WorkSum.Cmp(threshold) < 0 {
-		if t, ok := sm.recentlyFailedSync[peer.Addr()]; ok &&
-			time.Since(t) < syncPeerCooldown {
-			return nil
-		}
-		return sm.startPresyncSession(peer, state, chainStart,
-			msg.Headers, threshold)
-	}
-
-	// Scan backward to find the first header not yet in the block index.
-	firstNew := numHeaders
-	for firstNew >= 1 {
-		hash := msg.Headers[firstNew-1].BlockHeader.BlockHash()
-		have, err := sm.chain.HaveBlock(&hash)
-		if err != nil || have {
-			break
-		}
-		firstNew--
-	}
-	if firstNew >= numHeaders {
+	if t, ok := sm.recentlyFailedSync[peer.Addr()]; ok &&
+		time.Since(t) < syncPeerCooldown {
 		return nil
 	}
-
-	gdmsg := wire.NewMsgGetData()
-	for i := firstNew; i < numHeaders; i++ {
-		hash := msg.Headers[i].BlockHeader.BlockHash()
-		if _, exists := sm.requestedBlocks[hash]; exists {
-			continue
-		}
-		iv := wire.NewInvVect(wire.InvTypeWitnessBlock, &hash)
-		limitAdd(sm.requestedBlocks, hash, maxRequestedBlocks)
-		limitAdd(state.requestedBlocks, hash, maxRequestedBlocks)
-		gdmsg.AddInvVect(iv)
-	}
-	if len(gdmsg.InvList) > 0 {
-		peer.QueueMessage(gdmsg, nil)
-	}
-
-	return nil
+	sm.startPresyncSession(peer, state, chainStart, threshold)
+	return sm.feedPresync(peer, state, msg.Headers, true)
 }
 
 // handleNotFoundMsg handles notfound messages from all peers.

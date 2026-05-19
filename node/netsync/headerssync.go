@@ -16,7 +16,6 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
-	"github.com/pearl-research-labs/pearl/node/zkpow"
 )
 
 const (
@@ -261,6 +260,7 @@ func (s *HeadersSyncState) speculativeLocator(tip chainhash.Hash) []*chainhash.H
 // fullMessage is true when the batch was full (MaxBlockHeadersPerMsg),
 // indicating more headers are available.
 func (s *HeadersSyncState) ProcessNextHeaders(
+	chain *blockchain.BlockChain,
 	headers []wire.MsgHeader, fullMessage bool,
 ) HeadersSyncResult {
 
@@ -276,7 +276,7 @@ func (s *HeadersSyncState) ProcessNextHeaders(
 	// Spot-check responses: match incoming batch against pending checks.
 	if s.phase == PhasePresync {
 		if scIdx := s.findPendingSpotCheck(headers[0].BlockHeader.BlockHash()); scIdx >= 0 {
-			return s.handleSpotCheckResponse(headers[0], scIdx)
+			return s.handleSpotCheckResponse(chain, headers[0], scIdx)
 		}
 	}
 
@@ -451,17 +451,22 @@ func (s *HeadersSyncState) Abort() []chainhash.Hash {
 
 // --- internal: spot checks ---
 
-func (s *HeadersSyncState) handleSpotCheckResponse(hwc wire.MsgHeader, scIdx int) HeadersSyncResult {
+func (s *HeadersSyncState) handleSpotCheckResponse(chain *blockchain.BlockChain, hwc wire.MsgHeader, scIdx int) HeadersSyncResult {
 	var result HeadersSyncResult
 	scHeight := s.pendingSpotChecks[scIdx].height
 
 	if hwc.BlockCertificate() == nil {
 		log.Infof("Headers presync aborted with peer=%d: "+
 			"spot-check cert missing", s.peerID)
-	} else if err := zkpow.VerifyCertificate(&hwc.BlockHeader, hwc.BlockCertificate()); err != nil {
-		log.Warnf("Headers presync aborted with peer=%d: "+
-			"spot-check cert invalid: %v", s.peerID, err)
-		s.shouldPunish = true
+	} else if err := chain.CheckHeaderSanity(&hwc.BlockHeader, hwc.BlockCertificate()); err != nil {
+		if ruleErr, ok := err.(blockchain.RuleError); ok && ruleErr.ErrorCode == blockchain.ErrCertificateMissing {
+			log.Infof("Headers presync aborted with peer=%d: "+
+				"spot-check cert missing at height=%d", s.peerID, scHeight)
+		} else {
+			log.Warnf("Headers presync aborted with peer=%d: "+
+				"spot-check cert invalid: %v", s.peerID, err)
+			s.shouldPunish = true
+		}
 	} else {
 		if scIdx == 0 {
 			s.pendingSpotChecks = s.pendingSpotChecks[1:]

@@ -80,10 +80,3 @@ func banErr(format string, args ...interface{}) error {
 		Err:    fmt.Errorf(format, args...),
 	}
 }
-
-func disconnectErr(format string, args ...interface{}) error {
-	return &PeerActionError{
-		Action: PeerActionDisconnect,
-		Err:    fmt.Errorf(format, args...),
-	}
-}
