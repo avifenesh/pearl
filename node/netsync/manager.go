@@ -291,48 +291,66 @@ func (sm *SyncManager) startSync() {
 	}
 
 	bestPeer := sm.pickSyncCandidate()
+	if bestPeer == nil {
+		log.Warnf("No sync peer candidates available")
+		return
+	}
 
-	// Start syncing from the best peer if one was selected.
-	if bestPeer != nil {
-		// Clear the requestedBlocks if the sync peer changes, otherwise
-		// we may ignore blocks we need that the last sync peer failed
-		// to send.
-		sm.requestedBlocks = make(map[chainhash.Hash]struct{})
+	best := sm.chain.BestSnapshot()
 
-		locator, err := sm.chain.LatestBlockLocator()
-		if err != nil {
-			log.Errorf("Failed to get block locator for the "+
-				"latest block: %v", err)
+	// Skip peers that have nothing new to offer. If the peer announced
+	// a block we already have, skip it. Otherwise fall back to the
+	// version-message height: a peer at or below our height is skipped.
+	if announced := bestPeer.LastAnnouncedBlock(); announced != nil {
+		if have, _ := sm.chain.HaveBlock(announced); have {
+			log.Debugf("Skipping sync: candidate %s only "+
+				"announced blocks we already have",
+				bestPeer.Addr())
 			return
 		}
-
-		log.Infof("Syncing to block height %d from peer %v",
-			bestPeer.LastBlock(), bestPeer.Addr())
-
-		// When not current, enter headersFirstMode to restrict sync to
-		// a single peer. The initial getheaders uses zeroHash so the
-		// response triggers presync creation in handleHeadersMsg.
-		// Regression test mode uses direct block download instead.
-		if sm.chainParams != &chaincfg.RegressionNetParams {
-
-			bestPeer.PushGetHeadersMsg(locator, &zeroHash, false)
-			if !sm.current() {
-				sm.headersFirstMode = true
-				log.Infof("Starting headers-first presync from peer %s",
-					bestPeer.Addr())
-			}
-		} else {
-			bestPeer.PushGetBlocksMsg(locator, &zeroHash)
-		}
-		sm.syncPeer = bestPeer
-
-		// Reset the last progress time now that we have a non-nil
-		// syncPeer to avoid instantly detecting it as stalled in the
-		// event the progress time hasn't been updated recently.
-		sm.lastProgressTime = time.Now()
-	} else {
-		log.Warnf("No sync peer candidates available")
+	} else if bestPeer.LastBlock() <= best.Height {
+		log.Debugf("Skipping sync: candidate %s advertises "+
+			"height %d, our best is %d",
+			bestPeer.Addr(), bestPeer.LastBlock(), best.Height)
+		return
 	}
+
+	// Clear the requestedBlocks if the sync peer changes, otherwise
+	// we may ignore blocks we need that the last sync peer failed
+	// to send.
+	sm.requestedBlocks = make(map[chainhash.Hash]struct{})
+
+	locator, err := sm.chain.LatestBlockLocator()
+	if err != nil {
+		log.Errorf("Failed to get block locator for the "+
+			"latest block: %v", err)
+		return
+	}
+
+	log.Infof("Syncing to block height %d from peer %v",
+		bestPeer.LastBlock(), bestPeer.Addr())
+
+	// When not current, enter headersFirstMode to restrict sync to
+	// a single peer. The initial getheaders uses zeroHash so the
+	// response triggers presync creation in handleHeadersMsg.
+	// Regression test mode uses direct block download instead.
+	if sm.chainParams != &chaincfg.RegressionNetParams {
+
+		bestPeer.PushGetHeadersMsg(locator, &zeroHash, false)
+		if !sm.current() {
+			sm.headersFirstMode = true
+			log.Infof("Starting headers-first presync from peer %s",
+				bestPeer.Addr())
+		}
+	} else {
+		bestPeer.PushGetBlocksMsg(locator, &zeroHash)
+	}
+	sm.syncPeer = bestPeer
+
+	// Reset the last progress time now that we have a non-nil
+	// syncPeer to avoid instantly detecting it as stalled in the
+	// event the progress time hasn't been updated recently.
+	sm.lastProgressTime = time.Now()
 }
 
 // isSyncCandidate returns whether or not the peer is a candidate to consider
