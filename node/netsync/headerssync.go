@@ -24,6 +24,11 @@ const (
 	// rejected with probability >= 1 - 2^{-t}.
 	lg2UnauthorisedPresync = 100
 
+	// redownloadGetdataDepth is the minimum number of commitment-checked
+	// REDOWNLOAD headers that must exist in Tier-1 on top of an entry before
+	// it is eligible for getdata.
+	redownloadGetdataDepth = lg2UnauthorisedPresync
+
 	// certifiedWorkProportion is p: the minimum fraction of total work that
 	// must be backed by verified certificates for the presync to be secure.
 	certifiedWorkProportion = 0.5
@@ -33,19 +38,10 @@ const (
 	spotCheckMeanGap = 1000
 
 	// redownloadApprovedCap is the Tier-1 REDOWNLOAD approved-headers FIFO cap.
-	redownloadApprovedCap = 500
-
-	// redownloadApprovedHeadroom is the minimum free capacity required in
-	// Tier-1 before ProcessNextHeaders sets RequestMore=true.
-	redownloadApprovedHeadroom = 2 * wire.MaxBlockHeadersPerMsg
-
-	// redownloadGetdataDepth is the minimum number of commitment-checked
-	// REDOWNLOAD headers that must exist in Tier-1 on top of an entry before
-	// it is eligible for getdata.
-	redownloadGetdataDepth = lg2UnauthorisedPresync
+	redownloadApprovedCap = 1500
 
 	// redownloadPendingCap bounds the Tier-2 REDOWNLOAD buffer.
-	redownloadPendingCap = 100
+	redownloadPendingCap = 500
 )
 
 // HeadersSyncPhase represents the current phase of the two-phase presync.
@@ -315,8 +311,10 @@ func (s *HeadersSyncState) ProcessNextHeaders(
 					len(s.pendingSpotChecks))
 			default:
 				log.Infof("Headers presync aborted with peer=%d: "+
-					"peer chain ended at height=%d without sufficient work",
-					s.peerID, s.tip.Height)
+					"peer chain ended at height=%d without sufficient work "+
+					"(lg2_cum_work=%.2f, lg2_target_work=%.2f)",
+					s.peerID, s.tip.Height,
+					log2BigInt(s.tip.WorkSum), log2BigInt(s.minimumRequiredWork))
 			}
 		}
 
@@ -773,7 +771,7 @@ func (s *HeadersSyncState) eligibleForGetdata() int {
 }
 
 func (s *HeadersSyncState) hasRedownloadFifoCapacity() bool {
-	return len(s.redownloadApproved)+redownloadApprovedHeadroom <= redownloadApprovedCap
+	return len(s.redownloadApproved)+wire.MaxBlockHeadersPerMsg <= redownloadApprovedCap
 }
 
 func (s *HeadersSyncState) readyForNextHeaders() bool {
@@ -793,4 +791,12 @@ func (s *HeadersSyncState) tier2EntryIndex(hash chainhash.Hash) int {
 		}
 	}
 	return -1
+}
+
+func log2BigInt(n *big.Int) float64 {
+	if n.BitLen() == 0 {
+		return 0
+	}
+	f, _ := new(big.Float).SetInt(n).Float64()
+	return math.Log2(f)
 }

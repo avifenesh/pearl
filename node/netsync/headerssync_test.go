@@ -277,7 +277,7 @@ func TestValidateAndStoreRedownloadedHeader(t *testing.T) {
 
 func TestRedownloadTier1Capacity(t *testing.T) {
 	s := newRedownloadState(t)
-	targetFill := redownloadApprovedCap - redownloadApprovedHeadroom + 1
+	targetFill := redownloadApprovedCap - wire.MaxBlockHeadersPerMsg + 1
 	for i := 0; i < targetFill; i++ {
 		hdr := buildValidRedownloadHeader(s)
 		require.True(t, s.validateAndStoreRedownloadedHeader(hdr),
