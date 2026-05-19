@@ -38,10 +38,10 @@ const (
 	spotCheckMeanGap = 1000
 
 	// redownloadApprovedCap is the Tier-1 REDOWNLOAD approved-headers FIFO cap.
-	redownloadApprovedCap = 1500
+	redownloadApprovedCap = 2000
 
 	// redownloadPendingCap bounds the Tier-2 REDOWNLOAD buffer.
-	redownloadPendingCap = 500
+	redownloadPendingCap = 1000
 )
 
 // HeadersSyncPhase represents the current phase of the two-phase presync.
@@ -377,21 +377,26 @@ func (s *HeadersSyncState) BlocksToRequest() []chainhash.Hash {
 	}
 
 	free := redownloadPendingCap - len(s.tier2Expected)
-	if free <= 0 {
-		return nil
+	eligible := len(s.redownloadApproved)
+	if !s.redownloadShortBatchSeen {
+		eligible -= redownloadGetdataDepth
 	}
-
-	eligible := s.eligibleForGetdata()
 	n := min(free, eligible)
 	if n <= 0 {
 		return nil
 	}
-	n = min(n, len(s.redownloadApproved))
 
 	hashes := make([]chainhash.Hash, n)
 	copy(hashes, s.redownloadApproved[:n])
 	s.tier2Expected = append(s.tier2Expected, hashes...)
 	s.redownloadApproved = s.redownloadApproved[n:]
+
+	if s.tier2Pending == nil {
+		s.tier2Pending = make(map[chainhash.Hash]*btcutil.Block, redownloadPendingCap)
+	}
+	for i := range hashes {
+		s.tier2Pending[hashes[i]] = nil
+	}
 	return hashes
 }
 
@@ -405,21 +410,16 @@ func (s *HeadersSyncState) BlockArrived(hash chainhash.Hash, block *btcutil.Bloc
 		return result
 	}
 
-	idx := s.tier2EntryIndex(hash)
-	if idx < 0 {
+	if _, ok := s.tier2Pending[hash]; !ok {
 		return result
-	}
-
-	if s.tier2Pending == nil {
-		s.tier2Pending = make(map[chainhash.Hash]*btcutil.Block, redownloadPendingCap)
 	}
 	s.tier2Pending[hash] = block
 
 	// Drain in insertion order.
 	for len(s.tier2Expected) > 0 {
 		head := s.tier2Expected[0]
-		pending, ok := s.tier2Pending[head]
-		if !ok {
+		pending := s.tier2Pending[head]
+		if pending == nil {
 			break
 		}
 		delete(s.tier2Pending, head)
@@ -759,17 +759,6 @@ func (s *HeadersSyncState) scheduleNextSpotCheck(baseHeight int32) {
 
 // --- internal: Tier buffer management ---
 
-func (s *HeadersSyncState) eligibleForGetdata() int {
-	if s.redownloadShortBatchSeen {
-		return len(s.redownloadApproved)
-	}
-	n := len(s.redownloadApproved) - redownloadGetdataDepth
-	if n < 0 {
-		return 0
-	}
-	return n
-}
-
 func (s *HeadersSyncState) hasRedownloadFifoCapacity() bool {
 	return len(s.redownloadApproved)+wire.MaxBlockHeadersPerMsg <= redownloadApprovedCap
 }
@@ -782,15 +771,6 @@ func (s *HeadersSyncState) readyForNextHeaders() bool {
 		return false
 	}
 	return s.hasRedownloadFifoCapacity()
-}
-
-func (s *HeadersSyncState) tier2EntryIndex(hash chainhash.Hash) int {
-	for i := range s.tier2Expected {
-		if s.tier2Expected[i] == hash {
-			return i
-		}
-	}
-	return -1
 }
 
 func log2BigInt(n *big.Int) float64 {
