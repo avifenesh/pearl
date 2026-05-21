@@ -138,10 +138,15 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	// lets each caller wait independently, so a slow upstream cannot park
 	// callers whose own request context has been canceled.
 	resultCh := h.cache.group.DoChan(req.Method, func() (any, error) {
-		// The upstream call uses its own deadline. context.Background is
-		// the parent because this in-flight call is shared across many
-		// callers and must not be tied to any single caller's lifecycle.
-		upstreamCtx, cancel := context.WithTimeout(context.Background(), missTimeout)
+		// Inherit the request's context VALUES (Caddy stashes per-request
+		// state such as *caddy.Replacer there, which downstream handlers
+		// like reverse_proxy retrieve via type assertion and would panic
+		// if missing) but detach from the caller's cancellation, since
+		// this in-flight call is shared across many callers and must
+		// outlive any individual caller's lifecycle. A separate timeout
+		// bounds the upstream call so it cannot run forever.
+		parentCtx := context.WithoutCancel(r.Context())
+		upstreamCtx, cancel := context.WithTimeout(parentCtx, missTimeout)
 		defer cancel()
 		return h.fetchFromUpstream(upstreamCtx, r, body, next, req.Method, ttl)
 	})

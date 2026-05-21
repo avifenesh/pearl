@@ -329,6 +329,132 @@ func TestStuckUpstreamReleasesCoalescedWaiters(t *testing.T) {
 		"after the stuck miss is abandoned, the next request must succeed against a healthy backend")
 }
 
+// TestUpstreamRequestPreservesCallerContextValues asserts that the request
+// handed to the next handler on a cache miss carries the same context values
+// as the inbound request. Caddy stashes per-request state (most importantly
+// *caddy.Replacer) on the request context and downstream handlers such as
+// reverse_proxy retrieve it via type assertion; a request whose context lacks
+// those values will panic the upstream chain and crash the server.
+//
+// The coalesced upstream call runs in a separate goroutine spawned by
+// singleflight, so the upstream context cannot simply be the caller's
+// context. It must inherit the caller's context VALUES while detaching
+// from its cancellation, since the in-flight call is shared across many
+// callers and must outlive any single caller.
+func TestUpstreamRequestPreservesCallerContextValues(t *testing.T) {
+	type ctxKey struct{}
+
+	const sentinelValue = "v1"
+
+	var (
+		seenValue   string
+		seenOK      bool
+		callerKey   = ctxKey{}
+		nextEntered = make(chan struct{}, 1)
+	)
+
+	probeBackend := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		v, ok := r.Context().Value(callerKey).(string)
+		seenValue, seenOK = v, ok
+		select {
+		case nextEntered <- struct{}{}:
+		default:
+		}
+		body, _ := io.ReadAll(r.Body)
+		var req jsonrpcRequest
+		_ = json.Unmarshal(body, &req)
+		resp := jsonrpcResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result:  json.RawMessage(`{"capabilities":{}}`),
+		}
+		out, _ := json.Marshal(resp)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(out)
+		return nil
+	})
+
+	h := newTestHandler(CacheRule{Method: "getblocktemplate", TTL: caddy.Duration(5 * time.Second)})
+
+	body := makeJSONRPCBody("getblocktemplate", 1)
+	ctx := context.WithValue(context.Background(), callerKey, sentinelValue)
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, req, probeBackend),
+		"a request whose next handler reads a context value must not error")
+
+	select {
+	case <-nextEntered:
+	case <-time.After(time.Second):
+		t.Fatal("next handler was never invoked")
+	}
+
+	assert.True(t, seenOK, "next handler must see caller-side context values from singleflight goroutine")
+	assert.Equal(t, sentinelValue, seenValue, "next handler must observe the value the caller stored on its context")
+	assert.Equal(t, http.StatusOK, w.Code, "successful upstream call must surface a 200 to the caller")
+}
+
+// TestUpstreamRequestSurvivesCallerCancellation asserts that the next handler
+// is invoked with a context that is NOT canceled even after the caller's
+// request context has been canceled. The shared upstream call must outlive
+// any single caller's lifecycle so coalesced waiters and the cache entry are
+// produced from a clean run, not aborted because one caller hung up.
+func TestUpstreamRequestSurvivesCallerCancellation(t *testing.T) {
+	upstreamCtxErr := make(chan error, 1)
+
+	probeBackend := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		// Give the caller time to cancel its own context. If the upstream
+		// context were chained to the caller's it would be canceled here.
+		time.Sleep(50 * time.Millisecond)
+		upstreamCtxErr <- r.Context().Err()
+		body, _ := io.ReadAll(r.Body)
+		var req jsonrpcRequest
+		_ = json.Unmarshal(body, &req)
+		resp := jsonrpcResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result:  json.RawMessage(`{"capabilities":{}}`),
+		}
+		out, _ := json.Marshal(resp)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(out)
+		return nil
+	})
+
+	h := newTestHandler(CacheRule{Method: "getblocktemplate", TTL: caddy.Duration(5 * time.Second)})
+
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	body := makeJSONRPCBody("getblocktemplate", 1)
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body)).WithContext(callerCtx)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		_ = h.ServeHTTP(w, req, probeBackend)
+		close(done)
+	}()
+
+	// Cancel the caller while the upstream is in flight. The shared
+	// upstream call must not see this cancellation.
+	time.Sleep(10 * time.Millisecond)
+	cancelCaller()
+
+	select {
+	case err := <-upstreamCtxErr:
+		assert.NoError(t, err, "upstream context must not propagate the caller's cancellation")
+	case <-time.After(time.Second):
+		t.Fatal("upstream backend never observed its context state")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller goroutine never returned after cancellation")
+	}
+}
+
 func TestGETRequestsPassthrough(t *testing.T) {
 	var backendCalls atomic.Int64
 	backend := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
