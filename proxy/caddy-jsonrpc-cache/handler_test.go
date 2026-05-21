@@ -7,6 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -563,4 +566,52 @@ func TestValidateRejectsNegativeMissTimeout(t *testing.T) {
 		MissTimeout: caddy.Duration(-1),
 	}
 	assert.Error(t, h.Validate())
+}
+
+// TestCaddyfileExamplesParse asserts the example Caddyfiles shipped alongside
+// this plugin contain a jsonrpc_cache block whose syntax is accepted by the
+// plugin's UnmarshalCaddyfile. This guards against the examples drifting from
+// the parser as new directives are added.
+func TestCaddyfileExamplesParse(t *testing.T) {
+	examples := []string{
+		filepath.Join("..", "Caddyfile"),
+		filepath.Join("..", "Caddyfile.domain.example"),
+	}
+
+	for _, path := range examples {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			content, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			block := extractCaddyfileBlock(t, string(content), "jsonrpc_cache")
+
+			h := &Handler{}
+			require.NoError(t, h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(block)))
+			require.NotEmpty(t, h.Rules, "example should declare at least one cache rule")
+		})
+	}
+}
+
+// extractCaddyfileBlock returns the source span of the named top-level block,
+// from `name {` through its matching closing brace, suitable for feeding to a
+// caddyfile.Dispenser.
+func extractCaddyfileBlock(t *testing.T, content, name string) string {
+	t.Helper()
+	start := strings.Index(content, name+" {")
+	require.GreaterOrEqual(t, start, 0, "block %q not found", name)
+
+	depth := 0
+	for i := start; i < len(content); i++ {
+		switch content[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return content[start : i+1]
+			}
+		}
+	}
+	t.Fatalf("unterminated block %q", name)
+	return ""
 }

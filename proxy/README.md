@@ -109,6 +109,36 @@ issuance and renewal automatically.
 Mount the cert/key files into the proxy container and reference them in the
 Caddyfile.
 
+## JSON-RPC Caching
+
+The `jsonrpc_cache` directive caches responses for specific JSON-RPC methods.
+Concurrent requests for the same method are coalesced into a single upstream
+call, so high-fanout polling does not multiply backend load.
+
+```
+jsonrpc_cache {
+    cache getblocktemplate 1s
+    miss_timeout 5s
+}
+```
+
+* `cache <method> <ttl>` — cache responses for `<method>` for up to `<ttl>`.
+  Repeat the line for additional methods.
+* `miss_timeout <duration>` — bound how long a cache miss may wait for the
+  upstream before the in-flight call is abandoned. The caller receives an
+  HTTP 504 with a well-formed JSON-RPC error envelope whose `id` matches the
+  request. The next caller drives a fresh upstream attempt. Defaults to 5s
+  if omitted.
+
+Each caller also honors its own request context: if the downstream client
+cancels or times out while waiting on a coalesced call, the caller returns
+immediately without waiting for the upstream to finish.
+
+Responses are only stored when both the transport (HTTP 200) and the
+application (no JSON-RPC `error` field) are successful, so a transient
+upstream failure is not propagated to every caller for the duration of the
+TTL.
+
 ## Rate Limiting
 
 The default config limits each remote IP to **100 requests per minute**. Excess

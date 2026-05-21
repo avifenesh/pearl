@@ -11,6 +11,12 @@ localhost:44107 {
 
 	jsonrpc_cache {
 		cache getblocktemplate 1s
+
+		# Bound how long a cache miss may wait for the upstream before the
+		# in-flight call is abandoned and the caller receives an HTTP 504.
+		# Concurrent callers waiting on that call still unblock on their
+		# own request context. Defaults to 5s if omitted.
+		miss_timeout 5s
 	}
 
 	reverse_proxy 127.0.0.1:18334
