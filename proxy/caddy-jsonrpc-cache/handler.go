@@ -17,11 +17,14 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// defaultMissTimeout bounds how long a cache miss may wait for the upstream to
-// respond before the in-flight call is abandoned. Without a bound, a single
-// slow upstream call can park every concurrent caller for the duration of that
-// call, regardless of whether the callers themselves still want the result.
-const defaultMissTimeout = 5 * time.Second
+// defaultMissTimeout bounds how long a cache miss may wait for the upstream
+// before the in-flight call is abandoned. The default is tuned for the typical
+// usage of this plugin (a node serving polling clients with sub-second cache
+// TTLs): it is large enough to absorb normal upstream variance but short
+// enough that a stalled upstream is detected within a couple of caller poll
+// cycles, so the cascade of every concurrent caller parking on a single slow
+// call cannot become indistinguishable from the upstream being healthy.
+const defaultMissTimeout = 2 * time.Second
 
 func init() {
 	caddy.RegisterModule(Handler{})
@@ -239,14 +242,21 @@ func (h Handler) fetchFromUpstream(ctx context.Context, r *http.Request, body []
 }
 
 // responseHasError reports whether body parses as a JSON-RPC response with a
-// non-empty error field. Non-JSON-RPC bodies return false so that pass-through
-// behavior is unchanged for them.
+// non-empty error field. The literal JSON value null is treated as no error,
+// since many JSON-RPC implementations (including pearld) emit "error":null
+// alongside a successful result rather than omitting the field entirely.
+// Non-JSON-RPC bodies return false so that pass-through behavior is unchanged
+// for them.
 func responseHasError(body []byte) bool {
 	var resp jsonrpcResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return false
 	}
-	return len(resp.Error) != 0
+	trimmed := bytes.TrimSpace(resp.Error)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false
+	}
+	return true
 }
 
 // writeTimeoutResponse writes an HTTP 504 with a JSON-RPC 2.0 envelope. The

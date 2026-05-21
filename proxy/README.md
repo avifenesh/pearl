@@ -118,7 +118,7 @@ call, so high-fanout polling does not multiply backend load.
 ```
 jsonrpc_cache {
     cache getblocktemplate 1s
-    miss_timeout 5s
+    miss_timeout 2s
 }
 ```
 
@@ -127,7 +127,7 @@ jsonrpc_cache {
 * `miss_timeout <duration>` — bound how long a cache miss may wait for the
   upstream before the in-flight call is abandoned. The caller receives an
   HTTP 504 with a well-formed JSON-RPC error envelope whose `id` matches the
-  request. The next caller drives a fresh upstream attempt. Defaults to 5s
+  request. The next caller drives a fresh upstream attempt. Defaults to 2s
   if omitted.
 
 Each caller also honors its own request context: if the downstream client

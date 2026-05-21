@@ -99,7 +99,7 @@ localhost:${PROXY_PORT} {
 
 	jsonrpc_cache {
 		cache getblocktemplate 3s
-		miss_timeout 5s
+		miss_timeout 2s
 	}
 
 	reverse_proxy http://${NODE_RPC}

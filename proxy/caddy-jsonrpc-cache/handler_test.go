@@ -641,6 +641,43 @@ func TestJSONRPCErrorResponseNotCached(t *testing.T) {
 	assert.Equal(t, int64(2), backendCalls.Load(), "JSON-RPC error response must not be cached")
 }
 
+// TestNullErrorFieldIsCached asserts that responses carrying an explicit
+// "error":null alongside a successful result are still cached. Many JSON-RPC
+// implementations (notably pearld) emit the error field as a literal null on
+// success rather than omitting it; the cache must treat that as no error or
+// every getblocktemplate call would bypass the cache and amplify load on the
+// node.
+func TestNullErrorFieldIsCached(t *testing.T) {
+	var backendCalls atomic.Int64
+	nullErrorBackend := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		backendCalls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		var req jsonrpcRequest
+		_ = json.Unmarshal(body, &req)
+		// Emit the response exactly as pearld does: explicit "error":null.
+		// Build it as a raw bytes literal to avoid letting the encoder
+		// omit the null via omitempty semantics.
+		raw := []byte(`{"jsonrpc":"1.0","result":{"capabilities":{}},"error":null,"id":` + string(req.ID) + `}`)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(raw)
+		return nil
+	})
+
+	h := newTestHandler(CacheRule{Method: "getblocktemplate", TTL: caddy.Duration(5 * time.Second)})
+
+	w1 := doRequest(t, h, nullErrorBackend, "getblocktemplate", 1)
+	require.Equal(t, http.StatusOK, w1.Code)
+	assert.Empty(t, w1.Header().Get("X-Jsonrpc-Cache"), "first call is a miss")
+	assert.Equal(t, int64(1), backendCalls.Load())
+
+	w2 := doRequest(t, h, nullErrorBackend, "getblocktemplate", 2)
+	require.Equal(t, http.StatusOK, w2.Code)
+	assert.Equal(t, "HIT", w2.Header().Get("X-Jsonrpc-Cache"),
+		"second call within TTL must be a cache hit even when upstream emits \"error\":null")
+	assert.Equal(t, int64(1), backendCalls.Load(),
+		"upstream must not be called again when the first response is cacheable")
+}
+
 // TestCaddyfileParsesMissTimeout covers parser acceptance and rejection of
 // the miss_timeout subdirective.
 func TestCaddyfileParsesMissTimeout(t *testing.T) {
