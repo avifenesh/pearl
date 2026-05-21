@@ -25,7 +25,12 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //
 //	jsonrpc_cache {
 //	    cache <method> <ttl>
+//	    miss_timeout <duration>
 //	}
+//
+// `miss_timeout` is optional and bounds how long the cache may wait for a
+// single upstream call before abandoning it. Without an explicit value the
+// default (defaultMissTimeout) is used.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		if d.NextArg() {
@@ -47,6 +52,19 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					Method: args[0],
 					TTL:    caddy.Duration(ttl),
 				})
+			case "miss_timeout":
+				args := d.RemainingArgs()
+				if len(args) != 1 {
+					return d.ArgErr()
+				}
+				timeout, err := time.ParseDuration(args[0])
+				if err != nil {
+					return d.Errf("invalid miss_timeout %q: %v", args[0], err)
+				}
+				if timeout < 0 {
+					return d.Errf("miss_timeout must be non-negative, got %q", args[0])
+				}
+				h.MissTimeout = caddy.Duration(timeout)
 			default:
 				return d.Errf("unrecognized subdirective '%s'", d.Val())
 			}
