@@ -3,7 +3,7 @@ localhost:44107 {
 
 	rate_limit {
 		zone rpc {
-			key    {remote_host}
+			key {remote_host}
 			events 100
 			window 1m
 		}
