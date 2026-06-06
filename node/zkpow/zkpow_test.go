@@ -186,6 +186,52 @@ func TestVerifyProof_InvalidInput(t *testing.T) {
 }
 
 // ================================================================================
+// MOE CERTIFICATE VERIFICATION
+// ================================================================================
+
+// TestVerifyMoECertificateFailClosed asserts the MoE verifier is fail-closed:
+// a well-formed MoE certificate (header bindings satisfied) is still rejected
+// because the cryptographic verifier is not yet implemented.
+func TestVerifyMoECertificateFailClosed(t *testing.T) {
+	header := testBlockHeader()
+	cert := &wire.MoECertificate{ProofData: []byte{0x01, 0x02, 0x03}}
+
+	// Satisfy the header-binding checks so verification reaches the
+	// not-implemented (fail-closed) path rather than a binding mismatch.
+	header.ProofCommitment = cert.ProofCommitment()
+	cert.Hash = header.BlockHash()
+
+	err := VerifyCertificate(header, cert)
+	require.Error(t, err, "MoE certificate must be rejected (fail-closed)")
+	require.Contains(t, err.Error(), "not yet implemented")
+}
+
+// TestVerifyMoECertificateBindingChecks asserts the binding checks reject a
+// certificate whose hash/commitment do not match the header, and one with an
+// empty proof.
+func TestVerifyMoECertificateBindingChecks(t *testing.T) {
+	header := testBlockHeader()
+
+	// Mismatched block hash (Hash left zero, header has a real hash).
+	err := VerifyCertificate(header, &wire.MoECertificate{ProofData: []byte{0x01}})
+	require.Error(t, err)
+
+	// Matching bindings but empty proof data is also rejected.
+	matching := &wire.MoECertificate{}
+	header.ProofCommitment = matching.ProofCommitment()
+	matching.Hash = header.BlockHash()
+	require.Error(t, VerifyCertificate(header, matching),
+		"empty proof data must be rejected")
+}
+
+// TestMineMoEFailClosed asserts the MoE miner is fail-closed.
+func TestMineMoEFailClosed(t *testing.T) {
+	_, err := MineMoE(testBlockHeader())
+	require.Error(t, err, "MoE mining must be fail-closed")
+	require.Contains(t, err.Error(), "not yet implemented")
+}
+
+// ================================================================================
 // BENCHMARKS
 // ================================================================================
 

@@ -100,6 +100,58 @@ func TestSigNetMagic(t *testing.T) {
 	require.Equal(t, wire.SigNet, SigNetParams.Net)
 }
 
+// TestMoEForkActivation verifies the strict cutover at the MoE hardfork
+// activation height: ZK before the fork, MoE at and after it.
+func TestMoEForkActivation(t *testing.T) {
+	const forkHeight = int32(100)
+	p := Params{MoEForkHeight: forkHeight}
+
+	tests := []struct {
+		name        string
+		height      int32
+		wantActive  bool
+		wantVersion wire.CertificateVersion
+	}{
+		{"genesis", 0, false, wire.CertificateVersionZK},
+		{"just before fork", forkHeight - 1, false, wire.CertificateVersionZK},
+		{"at fork height", forkHeight, true, wire.CertificateVersionMoE},
+		{"after fork height", forkHeight + 1, true, wire.CertificateVersionMoE},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.wantActive, p.IsMoEForkActive(tt.height))
+			require.Equal(t, tt.wantVersion, p.RequiredCertVersion(tt.height))
+		})
+	}
+}
+
+// TestMoEForkDisabled verifies that a zero MoEForkHeight disables the fork at
+// every height (the legacy ZK certificate is always required).
+func TestMoEForkDisabled(t *testing.T) {
+	p := Params{MoEForkHeight: 0}
+	for _, height := range []int32{0, 1, 100, 1_000_000} {
+		require.False(t, p.IsMoEForkActive(height))
+		require.Equal(t, wire.CertificateVersionZK, p.RequiredCertVersion(height))
+	}
+}
+
+// TestShippedNetworksMoEForkDisabled enforces that every shipped network ships
+// with the MoE hardfork disabled until the verifier is finalized and an
+// activation height is chosen.
+func TestShippedNetworksMoEForkDisabled(t *testing.T) {
+	networks := map[string]*Params{
+		"mainnet":  &MainNetParams,
+		"testnet":  &TestNetParams,
+		"testnet2": &TestNet2Params,
+		"regtest":  &RegressionNetParams,
+		"simnet":   &SimNetParams,
+	}
+	for name, p := range networks {
+		require.Zerof(t, p.MoEForkHeight,
+			"%s must ship with the MoE fork disabled", name)
+	}
+}
+
 // compactToBig is a copy of the blockchain.CompactToBig function. We copy it
 // here so we don't run into a circular dependency just because of a test.
 func compactToBig(compact uint32) *big.Int {

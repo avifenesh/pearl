@@ -86,3 +86,13 @@ func Mine(header *wire.BlockHeader) (*wire.ZKCertificate, error) {
 
 	return cert, nil
 }
+
+// MineMoE mines a block under the MoE hardfork rules. Real proving is not yet
+// implemented, so this is fail-closed (always returns an error).
+//
+// TODO Or: implement when the MoE prover is finalized. The intended shape
+// mirrors Mine: call a Rust FFI entry point (e.g. C.mine_moe) to produce
+// PublicData and ProofData, then set header.ProofCommitment and cert.Hash.
+func MineMoE(header *wire.BlockHeader) (*wire.MoECertificate, error) {
+	return nil, fmt.Errorf("MoE mining not yet implemented")
+}

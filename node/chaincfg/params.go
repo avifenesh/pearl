@@ -249,6 +249,13 @@ type Params struct {
 	MinerConfirmationWindow       uint32
 	Deployments                   [DefinedDeployments]ConsensusDeployment
 
+	// MoEForkHeight is the block height at which the MoE hardfork activates.
+	// At and after this height blocks must carry the MoE certificate
+	// (wire.CertificateVersionMoE); before it, the legacy ZK certificate
+	// (wire.CertificateVersionZK). A value of 0 disables the fork (ZK at every
+	// height).
+	MoEForkHeight int32
+
 	// Mempool parameters
 	RelayNonStdTxs bool
 
@@ -266,6 +273,23 @@ type Params struct {
 	// BIP44 coin type used in the hierarchical deterministic path for
 	// address generation.
 	HDCoinType uint32
+}
+
+// IsMoEForkActive reports whether the MoE hardfork is active at the given block
+// height. The fork is disabled when MoEForkHeight is 0.
+func (p *Params) IsMoEForkActive(height int32) bool {
+	return p.MoEForkHeight != 0 && height >= p.MoEForkHeight
+}
+
+// RequiredCertVersion returns the block certificate version that a block at the
+// given height must use under the strict MoE hardfork cutover: the MoE
+// certificate at and after the activation height, the legacy ZK certificate
+// before it (and always, when the fork is disabled).
+func (p *Params) RequiredCertVersion(height int32) wire.CertificateVersion {
+	if p.IsMoEForkActive(height) {
+		return wire.CertificateVersionMoE
+	}
+	return wire.CertificateVersionZK
 }
 
 // MainNetParams defines the network parameters for the main Pearl network.

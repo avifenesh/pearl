@@ -2855,6 +2855,14 @@ func (b *blockManager) checkHeaderSanity(blockHeader *wire.BlockHeader,
 		return err
 	}
 
+	// Enforce the MoE certificate version cutover (contextual; the
+	// context-free sanity check below does not cover it).
+	if err := blockchain.CheckCertificateVersion(
+		cert, prevNodeHeight+1, &b.cfg.ChainParams,
+	); err != nil {
+		return err
+	}
+
 	return blockchain.CheckBlockHeaderSanity(
 		blockHeader, cert, b.cfg.ChainParams.PowLimit, b.cfg.TimeSource,
 		b.cfg.ChainParams.MaxTimeOffsetMinutes, flags,

@@ -34,6 +34,8 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 	switch c := cert.(type) {
 	case *wire.ZKCertificate:
 		return verifyZKCertificate(header, c)
+	case *wire.MoECertificate:
+		return verifyMoECertificate(header, c)
 	default:
 		return fmt.Errorf("unknown certificate type: %T", cert)
 	}
@@ -106,6 +108,39 @@ func verifyZKCertificateInner(header *wire.BlockHeader, c *wire.ZKCertificate, n
 	default:
 		return fmt.Errorf("unknown verification result %d: %s", result, msg)
 	}
+}
+
+// ================================================================================
+// MOE CERTIFICATE VERIFICATION
+// ================================================================================
+
+// verifyMoECertificate verifies an MoE certificate against the header. The
+// header-binding checks are format-independent, but the cryptographic proof
+// verification is not yet implemented, so this is fail-closed (always rejects).
+//
+// TODO Or: implement when the MoE verifier is finalized. The intended shape
+// mirrors verifyZKCertificateInner: convert the header to C form, copy the
+// PublicData, pin the ProofData, then call a Rust FFI entry point (e.g.
+// C.verify_moe_proof) and translate its result code.
+func verifyMoECertificate(header *wire.BlockHeader, c *wire.MoECertificate) error {
+	blockHash := header.BlockHash()
+	if !c.Hash.IsEqual(&blockHash) {
+		return fmt.Errorf("block hash mismatch: certificate has %s, header has %s",
+			c.Hash, blockHash)
+	}
+
+	certCommitment := c.ProofCommitment()
+	if header.ProofCommitment != certCommitment {
+		return fmt.Errorf("proof commitment mismatch: header has %s, certificate has %s",
+			header.ProofCommitment, certCommitment)
+	}
+
+	if len(c.ProofData) == 0 {
+		return fmt.Errorf("empty proof data")
+	}
+
+	// TODO Or: call the real MoE proof verifier (Rust FFI) when finalized.
+	return fmt.Errorf("MoE certificate verifier not yet implemented")
 }
 
 // ================================================================================

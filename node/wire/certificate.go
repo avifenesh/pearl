@@ -33,11 +33,12 @@ Certificate types implement perfectly mirrored Serialize/Deserialize methods:
 - Version handling delegated to MsgCertificate wrapper
 - Eliminates encoding/decoding asymmetry
 
-# NETWORK RESTRICTIONS
+# VERSION POLICY
 
-Only CertificateVersionZK is allowed. IsCertVersionAllowed(net, v) returns true
-only for CertificateVersionZK. blockchain.checkBlockSanity also validates via
-IsCertVersionAllowed.
+IsCertVersionAllowed is context-free: it reports whether a version is known and
+decodable here. Whether a version is valid at a given height (the MoE hardfork
+cutover) is a consensus rule enforced separately by
+blockchain.CheckCertificateVersion.
 
 # GENESIS BLOCKS
 
@@ -72,6 +73,10 @@ type CertificateVersion uint32
 const (
 	CertificateVersionNull CertificateVersion = 0
 	CertificateVersionZK   CertificateVersion = 1
+	// CertificateVersionMoE is the certificate version introduced by the
+	// MoE hardfork. Its concrete format and verifier are not yet finalized
+	// (see the TODOs on MoECertificate and verifyMoECertificate).
+	CertificateVersionMoE CertificateVersion = 2
 )
 
 // BlockCertificate is the interface that all certificate types must implement.
@@ -96,9 +101,12 @@ type BlockCertificate interface {
 	SerializedSize() int
 }
 
-// IsCertVersionAllowed reports whether certificate version v is permitted.
+// IsCertVersionAllowed reports whether certificate version v is structurally
+// known and can be decoded and dispatched by this node. It is context-free:
+// whether a version is valid at a given height (the MoE hardfork cutover) is
+// enforced separately in blockchain.CheckCertificateVersion.
 func IsCertVersionAllowed(v CertificateVersion) bool {
-	return v == CertificateVersionZK
+	return v == CertificateVersionZK || v == CertificateVersionMoE
 }
 
 // MsgCertificate wraps a BlockCertificate and handles polymorphic
@@ -143,6 +151,9 @@ func (m *MsgCertificate) PrlDecode(r io.Reader, pver uint32) error {
 
 	case CertificateVersionZK:
 		m.Certificate = &ZKCertificate{}
+
+	case CertificateVersionMoE:
+		m.Certificate = &MoECertificate{}
 
 	default:
 		return fmt.Errorf("unsupported certificate version: %d", version)

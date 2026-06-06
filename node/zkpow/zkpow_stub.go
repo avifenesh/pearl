@@ -27,3 +27,9 @@ func VerifyZKCertificateWithNbits(header *wire.BlockHeader, c *wire.ZKCertificat
 func Mine(header *wire.BlockHeader) (*wire.ZKCertificate, error) {
 	return nil, fmt.Errorf("zkpow: build with -tags zkpow to enable mining")
 }
+
+// MineMoE is the no-zkpow stub for MoE mining; the real implementation lives in
+// miner.go under the zkpow build tag.
+func MineMoE(header *wire.BlockHeader) (*wire.MoECertificate, error) {
+	return nil, fmt.Errorf("zkpow: build with -tags zkpow to enable mining")
+}
