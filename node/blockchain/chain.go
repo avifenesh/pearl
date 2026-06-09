@@ -2211,6 +2211,11 @@ func New(config *Config) (*BlockChain, error) {
 	if config.TimeSource == nil {
 		return nil, AssertError("blockchain.New timesource is nil")
 	}
+	// A negative MoEForkHeight would make IsMoEForkActive true from genesis,
+	// so reject it; 0 means the fork is not scheduled.
+	if config.ChainParams.MoEForkHeight < 0 {
+		return nil, AssertError("blockchain.New MoEForkHeight must be >= 0")
+	}
 
 	// Generate a checkpoint by height map from the provided checkpoints
 	// and assert the provided checkpoints are sorted by height as required.
