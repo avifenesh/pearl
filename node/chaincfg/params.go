@@ -251,8 +251,8 @@ type Params struct {
 
 	// MoEForkHeight is the block height at which the MoE hardfork activates.
 	// At and after this height blocks must carry the MoE certificate
-	// (wire.CertificateVersionMoE); before it, the legacy ZK certificate
-	// (wire.CertificateVersionZK). A value of 0 disables the fork (ZK at every
+	// (wire.CertificateVersionV2); before it, the legacy ZK certificate
+	// (wire.CertificateVersionV1). A value of 0 disables the fork (ZK at every
 	// height).
 	MoEForkHeight int32
 
@@ -287,9 +287,9 @@ func (p *Params) IsMoEForkActive(height int32) bool {
 // before it (and always, when the fork is disabled).
 func (p *Params) RequiredCertVersion(height int32) wire.CertificateVersion {
 	if p.IsMoEForkActive(height) {
-		return wire.CertificateVersionMoE
+		return wire.CertificateVersionV2
 	}
-	return wire.CertificateVersionZK
+	return wire.CertificateVersionV1
 }
 
 // MainNetParams defines the network parameters for the main Pearl network.

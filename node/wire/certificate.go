@@ -13,7 +13,7 @@ logic through three layers:
 
 1. MsgCertificate: Wrapper handling version-based polymorphic encoding/decoding
 2. BlockCertificate: Interface defining symmetric Serialize/Deserialize methods
-3. Certificate types: Concrete implementations (currently only ZKCertificate)
+3. Certificate types: Concrete implementations (CertificateV1; CertificateV2 not yet finalized)
 
 # WIRE FORMAT
 
@@ -21,7 +21,7 @@ Version-first design enables polymorphic decoding:
 
 	MsgCertificate: Version(4) + certificate-specific fields
 
-	ZKCertificate: BlockHash(32) + PublicData(164) + ProofLen(4) + ProofData
+	CertificateV1: BlockHash(32) + PublicData(164) + ProofLen(4) + ProofData
 	  Size: 238 + len(ProofData) bytes
 	  PublicData: committed public fields
 	  ProofData: Plonky2 proof bytes
@@ -42,7 +42,7 @@ blockchain.CheckCertificateVersion.
 
 # GENESIS BLOCKS
 
-All genesis blocks use empty ZKCertificate (all fields zero except hash).
+All genesis blocks use empty CertificateV1 (all fields zero except hash).
 Genesis blocks are never verified (hardcoded and trusted), only serialized.
 
 # IMPLEMENTATION NOTES
@@ -61,10 +61,10 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
 
-// MaxZKProofSize is the maximum size of a serialized ZK proof blob.
-const MaxZKProofSize = 60000
+// MaxProofSizeV1 is the maximum size of a serialized ZK proof blob.
+const MaxProofSizeV1 = 60000
 
-// CertificateMaxSize is the maximum allowed certificate size. Has headroom on top of MaxZKProofSize.
+// CertificateMaxSize is the maximum allowed certificate size. Has headroom on top of MaxProofSizeV1.
 const CertificateMaxSize = 65000
 
 // CertificateVersion identifies the certificate format version.
@@ -72,11 +72,11 @@ type CertificateVersion uint32
 
 const (
 	CertificateVersionNull CertificateVersion = 0
-	CertificateVersionZK   CertificateVersion = 1
-	// CertificateVersionMoE is the certificate version introduced by the
+	CertificateVersionV1   CertificateVersion = 1
+	// CertificateVersionV2 is the certificate version introduced by the
 	// MoE hardfork. Its concrete format and verifier are not yet finalized
-	// (see the TODOs on MoECertificate and verifyMoECertificate).
-	CertificateVersionMoE CertificateVersion = 2
+	// (see the TODOs on CertificateV2 and verifyV2Certificate).
+	CertificateVersionV2 CertificateVersion = 2
 )
 
 // BlockCertificate is the interface that all certificate types must implement.
@@ -106,7 +106,7 @@ type BlockCertificate interface {
 // whether a version is valid at a given height (the MoE hardfork cutover) is
 // enforced separately in blockchain.CheckCertificateVersion.
 func IsCertVersionAllowed(v CertificateVersion) bool {
-	return v == CertificateVersionZK || v == CertificateVersionMoE
+	return v == CertificateVersionV1 || v == CertificateVersionV2
 }
 
 // MsgCertificate wraps a BlockCertificate and handles polymorphic
@@ -149,11 +149,11 @@ func (m *MsgCertificate) PrlDecode(r io.Reader, pver uint32) error {
 		m.Certificate = nil
 		return nil
 
-	case CertificateVersionZK:
-		m.Certificate = &ZKCertificate{}
+	case CertificateVersionV1:
+		m.Certificate = &CertificateV1{}
 
-	case CertificateVersionMoE:
-		m.Certificate = &MoECertificate{}
+	case CertificateVersionV2:
+		m.Certificate = &CertificateV2{}
 
 	default:
 		return fmt.Errorf("unsupported certificate version: %d", version)

@@ -22,13 +22,13 @@ func SolveBlock(header *wire.BlockHeader, params *chaincfg.Params, height int32)
 
 	if params.Net == wire.SimNet {
 		if moeActive {
-			return &wire.MoECertificate{ProofData: []byte{0x00}}, nil
+			return &wire.CertificateV2{ProofData: []byte{0x00}}, nil
 		}
-		return &wire.ZKCertificate{ProofData: []byte{0x00}}, nil
+		return &wire.CertificateV1{ProofData: []byte{0x00}}, nil
 	}
 
 	if moeActive {
-		return zkpow.MineMoE(header)
+		return zkpow.MineV2(header)
 	}
-	return zkpow.Mine(header)
+	return zkpow.MineV1(header)
 }

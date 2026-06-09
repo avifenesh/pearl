@@ -42,12 +42,12 @@ func testBlockHeader(nbits ...uint32) *wire.BlockHeader {
 	}
 }
 
-// mineZKCertificate mines a block and returns the header and ZKCertificate.
-func mineZKCertificate(t *testing.T) (*wire.BlockHeader, *wire.ZKCertificate) {
+// mineCertificateV1 mines a block and returns the header and CertificateV1.
+func mineCertificateV1(t *testing.T) (*wire.BlockHeader, *wire.CertificateV1) {
 	t.Helper()
 	header := testBlockHeader()
 
-	cert, err := Mine(header)
+	cert, err := MineV1(header)
 	require.NoError(t, err, "mining should succeed")
 
 	return header, cert
@@ -65,9 +65,9 @@ func copyBlockHeader(h *wire.BlockHeader) *wire.BlockHeader {
 	}
 }
 
-// copyZKCertificate creates a deep copy of ZKCertificate for tampering tests
-func copyZKCertificate(c *wire.ZKCertificate) *wire.ZKCertificate {
-	cp := &wire.ZKCertificate{
+// copyCertificateV1 creates a deep copy of CertificateV1 for tampering tests
+func copyCertificateV1(c *wire.CertificateV1) *wire.CertificateV1 {
+	cp := &wire.CertificateV1{
 		Hash:       c.Hash,
 		PublicData: c.PublicData,
 		ProofData:  make([]byte, len(c.ProofData)),
@@ -84,7 +84,7 @@ func TestMineAndVerifyProof(t *testing.T) {
 		DefaultM, DefaultN, header.Bits)
 
 	startMine := time.Now()
-	header, cert := mineZKCertificate(t)
+	header, cert := mineCertificateV1(t)
 	t.Logf("Mining completed in %v, proof size: %d bytes", time.Since(startMine), len(cert.ProofData))
 
 	startVerify := time.Now()
@@ -97,7 +97,7 @@ func TestMineAndVerifyProof(t *testing.T) {
 // PublicData layout: config(0..52) | hash_a(52..84) | hash_b(84..116) | hash_jackpot(116..148) |
 // m,n,t_rows,t_cols(148..164)
 func TestTamperedParams(t *testing.T) {
-	header, cert := mineZKCertificate(t)
+	header, cert := mineCertificateV1(t)
 
 	// Block header field tampering.
 	headerTampers := []struct {
@@ -121,10 +121,10 @@ func TestTamperedParams(t *testing.T) {
 	}
 
 	// Every byte of PublicData must individually cause rejection when flipped.
-	for i := 0; i < wire.PublicDataSize; i++ {
+	for i := 0; i < wire.PublicDataSizeV1; i++ {
 		i := i
 		t.Run(fmt.Sprintf("PublicData[%d]", i), func(t *testing.T) {
-			tamperedCert := copyZKCertificate(cert)
+			tamperedCert := copyCertificateV1(cert)
 			tamperedCert.PublicData[i] ^= 0xFF
 			err := VerifyCertificate(header, tamperedCert)
 			require.Error(t, err, "proof should be rejected when PublicData[%d] is tampered", i)
@@ -134,7 +134,7 @@ func TestTamperedParams(t *testing.T) {
 
 	// ProofData tampering.
 	t.Run("ProofData", func(t *testing.T) {
-		tamperedCert := copyZKCertificate(cert)
+		tamperedCert := copyCertificateV1(cert)
 		tamperedCert.ProofData[20] ^= 0xFF
 		err := VerifyCertificate(header, tamperedCert)
 		require.Error(t, err, "proof should be rejected when ProofData is tampered")
@@ -144,9 +144,9 @@ func TestTamperedParams(t *testing.T) {
 
 // TestTamperedProof verifies that overwriting the metadata fields in proof_data is rejected.
 func TestTamperedProof(t *testing.T) {
-	header, cert := mineZKCertificate(t)
+	header, cert := mineCertificateV1(t)
 
-	tamperedCert := copyZKCertificate(cert)
+	tamperedCert := copyCertificateV1(cert)
 	for i := 0; i < 50; i++ {
 		tamperedCert.ProofData[i] ^= 0xFF
 	}
@@ -160,7 +160,7 @@ func TestTamperedProof(t *testing.T) {
 func TestVerifyProof_InvalidInput(t *testing.T) {
 	header := testBlockHeader()
 
-	// Generate a random 70400-byte proof (the native size of a valid ZKCertificate)
+	// Generate a random 70400-byte proof (the native size of a valid CertificateV1)
 	randomProof := make([]byte, 70400)
 	for i := range randomProof {
 		randomProof[i] = byte(i % 256)
@@ -169,11 +169,11 @@ func TestVerifyProof_InvalidInput(t *testing.T) {
 	testCases := []struct {
 		name   string
 		header *wire.BlockHeader
-		cert   *wire.ZKCertificate
+		cert   *wire.CertificateV1
 	}{
-		{"EmptyProofData", header, &wire.ZKCertificate{ProofData: nil}},
-		{"ZeroLengthProofData", header, &wire.ZKCertificate{ProofData: []byte{}}},
-		{"Random70400ByteProof", header, &wire.ZKCertificate{ProofData: randomProof}},
+		{"EmptyProofData", header, &wire.CertificateV1{ProofData: nil}},
+		{"ZeroLengthProofData", header, &wire.CertificateV1{ProofData: []byte{}}},
+		{"Random70400ByteProof", header, &wire.CertificateV1{ProofData: randomProof}},
 	}
 
 	for _, tc := range testCases {
@@ -189,12 +189,12 @@ func TestVerifyProof_InvalidInput(t *testing.T) {
 // MOE CERTIFICATE VERIFICATION
 // ================================================================================
 
-// TestVerifyMoECertificateFailClosed asserts the MoE verifier is fail-closed:
+// TestVerifyV2CertificateFailClosed asserts the MoE verifier is fail-closed:
 // a well-formed MoE certificate (header bindings satisfied) is still rejected
 // because the cryptographic verifier is not yet implemented.
-func TestVerifyMoECertificateFailClosed(t *testing.T) {
+func TestVerifyV2CertificateFailClosed(t *testing.T) {
 	header := testBlockHeader()
-	cert := &wire.MoECertificate{ProofData: []byte{0x01, 0x02, 0x03}}
+	cert := &wire.CertificateV2{ProofData: []byte{0x01, 0x02, 0x03}}
 
 	// Satisfy the header-binding checks so verification reaches the
 	// not-implemented (fail-closed) path rather than a binding mismatch.
@@ -206,27 +206,27 @@ func TestVerifyMoECertificateFailClosed(t *testing.T) {
 	require.Contains(t, err.Error(), "not yet implemented")
 }
 
-// TestVerifyMoECertificateBindingChecks asserts the binding checks reject a
+// TestVerifyV2CertificateBindingChecks asserts the binding checks reject a
 // certificate whose hash/commitment do not match the header, and one with an
 // empty proof.
-func TestVerifyMoECertificateBindingChecks(t *testing.T) {
+func TestVerifyV2CertificateBindingChecks(t *testing.T) {
 	header := testBlockHeader()
 
 	// Mismatched block hash (Hash left zero, header has a real hash).
-	err := VerifyCertificate(header, &wire.MoECertificate{ProofData: []byte{0x01}})
+	err := VerifyCertificate(header, &wire.CertificateV2{ProofData: []byte{0x01}})
 	require.Error(t, err)
 
 	// Matching bindings but empty proof data is also rejected.
-	matching := &wire.MoECertificate{}
+	matching := &wire.CertificateV2{}
 	header.ProofCommitment = matching.ProofCommitment()
 	matching.Hash = header.BlockHash()
 	require.Error(t, VerifyCertificate(header, matching),
 		"empty proof data must be rejected")
 }
 
-// TestMineMoEFailClosed asserts the MoE miner is fail-closed.
-func TestMineMoEFailClosed(t *testing.T) {
-	_, err := MineMoE(testBlockHeader())
+// TestMineV2FailClosed asserts the MoE miner is fail-closed.
+func TestMineV2FailClosed(t *testing.T) {
+	_, err := MineV2(testBlockHeader())
 	require.Error(t, err, "MoE mining must be fail-closed")
 	require.Contains(t, err.Error(), "not yet implemented")
 }
@@ -255,7 +255,7 @@ func BenchmarkMine(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				cert, err := Mine(header)
+				cert, err := MineV1(header)
 				if err != nil {
 					b.Fatalf("mining failed: %v", err)
 				}
@@ -274,7 +274,7 @@ func BenchmarkMine(b *testing.B) {
 func BenchmarkVerifyProof(b *testing.B) {
 	header := testBlockHeader()
 
-	cert, err := Mine(header)
+	cert, err := MineV1(header)
 	if err != nil {
 		b.Fatalf("mining failed during setup: %v", err)
 	}

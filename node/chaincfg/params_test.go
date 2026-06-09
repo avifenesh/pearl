@@ -112,10 +112,10 @@ func TestMoEForkActivation(t *testing.T) {
 		wantActive  bool
 		wantVersion wire.CertificateVersion
 	}{
-		{"genesis", 0, false, wire.CertificateVersionZK},
-		{"just before fork", forkHeight - 1, false, wire.CertificateVersionZK},
-		{"at fork height", forkHeight, true, wire.CertificateVersionMoE},
-		{"after fork height", forkHeight + 1, true, wire.CertificateVersionMoE},
+		{"genesis", 0, false, wire.CertificateVersionV1},
+		{"just before fork", forkHeight - 1, false, wire.CertificateVersionV1},
+		{"at fork height", forkHeight, true, wire.CertificateVersionV2},
+		{"after fork height", forkHeight + 1, true, wire.CertificateVersionV2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -131,7 +131,7 @@ func TestMoEForkDisabled(t *testing.T) {
 	p := Params{MoEForkHeight: 0}
 	for _, height := range []int32{0, 1, 100, 1_000_000} {
 		require.False(t, p.IsMoEForkActive(height))
-		require.Equal(t, wire.CertificateVersionZK, p.RequiredCertVersion(height))
+		require.Equal(t, wire.CertificateVersionV1, p.RequiredCertVersion(height))
 	}
 }
 

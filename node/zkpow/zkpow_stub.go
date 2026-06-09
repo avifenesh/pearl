@@ -20,16 +20,16 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification")
 }
 
-func VerifyZKCertificateWithNbits(header *wire.BlockHeader, c *wire.ZKCertificate, nbitsOverride uint32) error {
+func VerifyCertificateV1WithNbits(header *wire.BlockHeader, c *wire.CertificateV1, nbitsOverride uint32) error {
 	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification with nbits override")
 }
 
-func Mine(header *wire.BlockHeader) (*wire.ZKCertificate, error) {
+func MineV1(header *wire.BlockHeader) (*wire.CertificateV1, error) {
 	return nil, fmt.Errorf("zkpow: build with -tags zkpow to enable mining")
 }
 
-// MineMoE is the no-zkpow stub for MoE mining; the real implementation lives in
+// MineV2 is the no-zkpow stub for MoE mining; the real implementation lives in
 // miner.go under the zkpow build tag.
-func MineMoE(header *wire.BlockHeader) (*wire.MoECertificate, error) {
+func MineV2(header *wire.BlockHeader) (*wire.CertificateV2, error) {
 	return nil, fmt.Errorf("zkpow: build with -tags zkpow to enable mining")
 }

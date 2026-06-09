@@ -49,13 +49,13 @@ var defaultMiningConfig = [miningConfigSize]byte{
 	// reserved (32 bytes) are zero
 }
 
-// Mine mines a block using the Rust implementation and returns a ZKCertificate.
+// MineV1 mines a block using the Rust implementation and returns a CertificateV1.
 // This function modifies header.ProofCommitment to match the mined certificate.
-func Mine(header *wire.BlockHeader) (*wire.ZKCertificate, error) {
+func MineV1(header *wire.BlockHeader) (*wire.CertificateV1, error) {
 	cHeader := blockHeaderToC(header)
 	cMiningConfig := (*[miningConfigSize]C.uint8_t)(unsafe.Pointer(&defaultMiningConfig))
 
-	proofData := make([]byte, wire.MaxZKProofSize)
+	proofData := make([]byte, wire.MaxProofSizeV1)
 	var pinner runtime.Pinner
 	pinner.Pin(&proofData[0])
 	defer pinner.Unpin()
@@ -76,10 +76,10 @@ func Mine(header *wire.BlockHeader) (*wire.ZKCertificate, error) {
 		return nil, fmt.Errorf("mining failed (code %d): %s", result, msg)
 	}
 
-	cert := &wire.ZKCertificate{
+	cert := &wire.CertificateV1{
 		ProofData: proofData[:int(cZKProof.proof_blob_len)],
 	}
-	C.memcpy(unsafe.Pointer(&cert.PublicData[0]), unsafe.Pointer(&cZKProof.public_data[0]), C.size_t(wire.PublicDataSize))
+	C.memcpy(unsafe.Pointer(&cert.PublicData[0]), unsafe.Pointer(&cZKProof.public_data[0]), C.size_t(wire.PublicDataSizeV1))
 
 	header.ProofCommitment = cert.ProofCommitment()
 	cert.Hash = header.BlockHash()
@@ -87,12 +87,12 @@ func Mine(header *wire.BlockHeader) (*wire.ZKCertificate, error) {
 	return cert, nil
 }
 
-// MineMoE mines a block under the MoE hardfork rules. Real proving is not yet
+// MineV2 mines a block under the MoE hardfork rules. Real proving is not yet
 // implemented, so this is fail-closed (always returns an error).
 //
 // TODO Or: implement when the MoE prover is finalized. The intended shape
-// mirrors Mine: call a Rust FFI entry point (e.g. C.mine_moe) to produce
+// mirrors MineV1: call a Rust FFI entry point (e.g. C.mine_moe) to produce
 // PublicData and ProofData, then set header.ProofCommitment and cert.Hash.
-func MineMoE(header *wire.BlockHeader) (*wire.MoECertificate, error) {
+func MineV2(header *wire.BlockHeader) (*wire.CertificateV2, error) {
 	return nil, fmt.Errorf("MoE mining not yet implemented")
 }

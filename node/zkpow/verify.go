@@ -32,32 +32,32 @@ import (
 // It returns an error if the certificate is invalid or does not match the header.
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
 	switch c := cert.(type) {
-	case *wire.ZKCertificate:
-		return verifyZKCertificate(header, c)
-	case *wire.MoECertificate:
-		return verifyMoECertificate(header, c)
+	case *wire.CertificateV1:
+		return verifyV1Certificate(header, c)
+	case *wire.CertificateV2:
+		return verifyV2Certificate(header, c)
 	default:
 		return fmt.Errorf("unknown certificate type: %T", cert)
 	}
 }
 
 // ================================================================================
-// ZK CERTIFICATE VERIFICATION
+// V1 CERTIFICATE VERIFICATION
 // ================================================================================
 
-func verifyZKCertificate(header *wire.BlockHeader, c *wire.ZKCertificate) error {
-	return verifyZKCertificateInner(header, c, nil)
+func verifyV1Certificate(header *wire.BlockHeader, c *wire.CertificateV1) error {
+	return verifyV1CertificateInner(header, c, nil)
 }
 
-// VerifyZKCertificateWithNbits verifies a ZK certificate using nbitsOverride
+// VerifyCertificateV1WithNbits verifies a V1 certificate using nbitsOverride
 // as the difficulty target instead of the block header's nbits field.
 //
 // WARNING: This bypasses the header's embedded difficulty, Do not use it in block acceptance or relay paths.
-func VerifyZKCertificateWithNbits(header *wire.BlockHeader, c *wire.ZKCertificate, nbitsOverride uint32) error {
-	return verifyZKCertificateInner(header, c, &nbitsOverride)
+func VerifyCertificateV1WithNbits(header *wire.BlockHeader, c *wire.CertificateV1, nbitsOverride uint32) error {
+	return verifyV1CertificateInner(header, c, &nbitsOverride)
 }
 
-func verifyZKCertificateInner(header *wire.BlockHeader, c *wire.ZKCertificate, nbitsOverride *uint32) error {
+func verifyV1CertificateInner(header *wire.BlockHeader, c *wire.CertificateV1, nbitsOverride *uint32) error {
 	blockHash := header.BlockHash()
 	if !c.Hash.IsEqual(&blockHash) {
 		return fmt.Errorf("block hash mismatch: certificate has %s, header has %s",
@@ -77,7 +77,7 @@ func verifyZKCertificateInner(header *wire.BlockHeader, c *wire.ZKCertificate, n
 	cBlockHeader := blockHeaderToC(header)
 
 	var cZKProof C.CZKProof
-	C.memcpy(unsafe.Pointer(&cZKProof.public_data[0]), unsafe.Pointer(&c.PublicData[0]), C.size_t(wire.PublicDataSize))
+	C.memcpy(unsafe.Pointer(&cZKProof.public_data[0]), unsafe.Pointer(&c.PublicData[0]), C.size_t(wire.PublicDataSizeV1))
 
 	// Pin the ProofData memory to prevent GC from moving it during the C call
 	var pinner runtime.Pinner
@@ -111,18 +111,18 @@ func verifyZKCertificateInner(header *wire.BlockHeader, c *wire.ZKCertificate, n
 }
 
 // ================================================================================
-// MOE CERTIFICATE VERIFICATION
+// V2 CERTIFICATE VERIFICATION
 // ================================================================================
 
-// verifyMoECertificate verifies an MoE certificate against the header. The
+// verifyV2Certificate verifies a V2 certificate against the header. The
 // header-binding checks are format-independent, but the cryptographic proof
 // verification is not yet implemented, so this is fail-closed (always rejects).
 //
-// TODO Or: implement when the MoE verifier is finalized. The intended shape
-// mirrors verifyZKCertificateInner: convert the header to C form, copy the
+// TODO Or: implement when the V2 verifier is finalized. The intended shape
+// mirrors verifyV1CertificateInner: convert the header to C form, copy the
 // PublicData, pin the ProofData, then call a Rust FFI entry point (e.g.
 // C.verify_moe_proof) and translate its result code.
-func verifyMoECertificate(header *wire.BlockHeader, c *wire.MoECertificate) error {
+func verifyV2Certificate(header *wire.BlockHeader, c *wire.CertificateV2) error {
 	blockHash := header.BlockHash()
 	if !c.Hash.IsEqual(&blockHash) {
 		return fmt.Errorf("block hash mismatch: certificate has %s, header has %s",
@@ -139,8 +139,8 @@ func verifyMoECertificate(header *wire.BlockHeader, c *wire.MoECertificate) erro
 		return fmt.Errorf("empty proof data")
 	}
 
-	// TODO Or: call the real MoE proof verifier (Rust FFI) when finalized.
-	return fmt.Errorf("MoE certificate verifier not yet implemented")
+	// TODO Or: call the real V2 proof verifier (Rust FFI) when finalized.
+	return fmt.Errorf("V2 certificate verifier not yet implemented")
 }
 
 // ================================================================================

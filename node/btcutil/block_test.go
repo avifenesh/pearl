@@ -147,7 +147,7 @@ func TestBlock(t *testing.T) {
 	// Certificate(46) + Header(108) + varint(1) = 155 bytes before first tx
 	// Certificate format: Version(4) + BlockHash(32) + ProofLen(4) + ProofData(6) = 46 bytes
 	// Header format: Version(4) + PrevBlock(32) + MerkleRoot(32) + Timestamp(4) + Bits(4) + ProofCommitment(32) = 108 bytes
-	certLength := 212 // ZKCertificate: version(4) + hash(32) + PublicData(164) + proofLen(4) + proofData(8)
+	certLength := 212 // CertificateV1: version(4) + hash(32) + PublicData(164) + proofLen(4) + proofData(8)
 	headerLength := 108
 	varintLength := 1                                      // tx count varint
 	baseOffset := certLength + headerLength + varintLength // 305
@@ -308,11 +308,11 @@ func TestBlockErrors(t *testing.T) {
 }
 
 // Block100000 defines block 100,000 of the block chain.  It is used to
-// test Block operations. Uses ZKCertificate with stub proof (not valid for PoW verification).
+// test Block operations. Uses CertificateV1 with stub proof (not valid for PoW verification).
 var Block100000 = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      chainhash.Hash{},
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe},
 			},

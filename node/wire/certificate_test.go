@@ -44,13 +44,13 @@ func testBlockHeader(nbits ...uint32) wire.BlockHeader {
 }
 
 // ============================================================================
-// ZKCertificate Tests
+// CertificateV1 Tests
 // ============================================================================
 
-func TestZKCertificate_SerializeDeserialize(t *testing.T) {
+func TestCertificateV1_SerializeDeserialize(t *testing.T) {
 	header := testBlockHeader()
 
-	cert, err := zkpow.Mine(&header)
+	cert, err := zkpow.MineV1(&header)
 	require.NoError(t, err, "mining should succeed")
 
 	var buf bytes.Buffer
@@ -61,7 +61,7 @@ func TestZKCertificate_SerializeDeserialize(t *testing.T) {
 	require.NotEmpty(t, serialized, "serialized data should not be empty")
 	t.Logf("Serialized size: %d bytes", len(serialized))
 
-	deserialized := &wire.ZKCertificate{}
+	deserialized := &wire.CertificateV1{}
 	err = deserialized.Deserialize(bytes.NewReader(serialized))
 	require.NoError(t, err, "deserialization should succeed")
 
@@ -70,26 +70,26 @@ func TestZKCertificate_SerializeDeserialize(t *testing.T) {
 	require.Equal(t, cert.ProofData, deserialized.ProofData)
 }
 
-func TestZKCertificate_Verify(t *testing.T) {
+func TestCertificateV1_Verify(t *testing.T) {
 	header := testBlockHeader()
 
-	cert, err := zkpow.Mine(&header)
+	cert, err := zkpow.MineV1(&header)
 	require.NoError(t, err, "mining should succeed")
 
 	err = zkpow.VerifyCertificate(&header, cert)
-	require.NoError(t, err, "valid ZKCertificate should verify")
+	require.NoError(t, err, "valid CertificateV1 should verify")
 }
 
-func TestZKCertificate_VerifyErrors(t *testing.T) {
+func TestCertificateV1_VerifyErrors(t *testing.T) {
 	header := testBlockHeader()
 
-	origCert, err := zkpow.Mine(&header)
+	origCert, err := zkpow.MineV1(&header)
 	require.NoError(t, err, "mining should succeed")
 
-	createCert := func() *wire.ZKCertificate {
+	createCert := func() *wire.CertificateV1 {
 		proofDataCopy := make([]byte, len(origCert.ProofData))
 		copy(proofDataCopy, origCert.ProofData)
-		return &wire.ZKCertificate{
+		return &wire.CertificateV1{
 			Hash:       origCert.Hash,
 			PublicData: origCert.PublicData,
 			ProofData:  proofDataCopy,
@@ -99,24 +99,24 @@ func TestZKCertificate_VerifyErrors(t *testing.T) {
 	// Test certificate-level validation only (not underlying verifier logic)
 	tests := []struct {
 		name   string
-		modify func(*wire.ZKCertificate)
+		modify func(*wire.CertificateV1)
 	}{
 		{
 			name: "empty proof data",
-			modify: func(c *wire.ZKCertificate) {
+			modify: func(c *wire.CertificateV1) {
 				c.ProofData = nil
 			},
 		},
 		{
 			name: "corrupted config",
-			modify: func(c *wire.ZKCertificate) {
+			modify: func(c *wire.CertificateV1) {
 				// Flip a random byte to corrupt it
-				c.PublicData[wire.PublicDataSize/2] ^= 0xFF
+				c.PublicData[wire.PublicDataSizeV1/2] ^= 0xFF
 			},
 		},
 		{
 			name: "block hash mismatch",
-			modify: func(c *wire.ZKCertificate) {
+			modify: func(c *wire.CertificateV1) {
 				c.Hash[0] ^= 0xFF
 			},
 		},
@@ -133,14 +133,14 @@ func TestZKCertificate_VerifyErrors(t *testing.T) {
 	}
 }
 
-func TestZKCertificate_Version(t *testing.T) {
-	cert := &wire.ZKCertificate{}
-	require.Equal(t, wire.CertificateVersionZK, cert.Version())
+func TestCertificateV1_Version(t *testing.T) {
+	cert := &wire.CertificateV1{}
+	require.Equal(t, wire.CertificateVersionV1, cert.Version())
 }
 
-func TestZKCertificate_BlockHash(t *testing.T) {
+func TestCertificateV1_BlockHash(t *testing.T) {
 	expectedHash := chainhash.Hash{1, 2, 3, 4}
-	cert := &wire.ZKCertificate{Hash: expectedHash}
+	cert := &wire.CertificateV1{Hash: expectedHash}
 	require.Equal(t, expectedHash, cert.BlockHash())
 }
 
@@ -151,12 +151,12 @@ func TestZKCertificate_BlockHash(t *testing.T) {
 func TestMsgCertificate_ZK_RoundTrip(t *testing.T) {
 	header := testBlockHeader()
 
-	cert, err := zkpow.Mine(&header)
+	cert, err := zkpow.MineV1(&header)
 	require.NoError(t, err, "mining should succeed")
 
 	msg := &wire.MsgCertificate{Certificate: cert}
 	require.NotNil(t, msg)
-	require.Equal(t, wire.CertificateVersionZK, msg.Certificate.Version())
+	require.Equal(t, wire.CertificateVersionV1, msg.Certificate.Version())
 
 	var buf bytes.Buffer
 	err = msg.PrlEncode(&buf, wire.ProtocolVersion)
@@ -166,21 +166,21 @@ func TestMsgCertificate_ZK_RoundTrip(t *testing.T) {
 	err = decoded.PrlDecode(bytes.NewReader(buf.Bytes()), wire.ProtocolVersion)
 	require.NoError(t, err, "decoding should succeed")
 
-	require.Equal(t, wire.CertificateVersionZK, decoded.Certificate.Version())
-	decodedZK, ok := decoded.Certificate.(*wire.ZKCertificate)
-	require.True(t, ok, "decoded certificate should be ZKCertificate")
+	require.Equal(t, wire.CertificateVersionV1, decoded.Certificate.Version())
+	decodedZK, ok := decoded.Certificate.(*wire.CertificateV1)
+	require.True(t, ok, "decoded certificate should be CertificateV1")
 	require.Equal(t, cert.Hash, decodedZK.Hash)
 }
 
 // ============================================================================
-// MoECertificate Tests
+// CertificateV2 Tests
 // ============================================================================
 
-// newTestMoECert builds an MoECertificate with deterministic placeholder
+// newTestMoECert builds an CertificateV2 with deterministic placeholder
 // contents. It does not call the (fail-closed) MoE miner, so these tests
 // exercise the wire layer independently of the verifier implementation.
-func newTestMoECert() *wire.MoECertificate {
-	cert := &wire.MoECertificate{
+func newTestMoECert() *wire.CertificateV2 {
+	cert := &wire.CertificateV2{
 		Hash:      chainhash.Hash{0x11, 0x22, 0x33, 0x44},
 		ProofData: []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x02},
 	}
@@ -190,28 +190,28 @@ func newTestMoECert() *wire.MoECertificate {
 	return cert
 }
 
-func TestMoECertificate_Version(t *testing.T) {
-	cert := &wire.MoECertificate{}
-	require.Equal(t, wire.CertificateVersionMoE, cert.Version())
+func TestCertificateV2_Version(t *testing.T) {
+	cert := &wire.CertificateV2{}
+	require.Equal(t, wire.CertificateVersionV2, cert.Version())
 }
 
-func TestMoECertificate_BlockHash(t *testing.T) {
+func TestCertificateV2_BlockHash(t *testing.T) {
 	expectedHash := chainhash.Hash{1, 2, 3, 4}
-	cert := &wire.MoECertificate{Hash: expectedHash}
+	cert := &wire.CertificateV2{Hash: expectedHash}
 	require.Equal(t, expectedHash, cert.BlockHash())
 }
 
-func TestMoECertificate_SerializeDeserialize(t *testing.T) {
+func TestCertificateV2_SerializeDeserialize(t *testing.T) {
 	cert := newTestMoECert()
 
 	var buf bytes.Buffer
 	require.NoError(t, cert.Serialize(&buf), "serialization should succeed")
 
-	wantSize := 32 + wire.MoEPublicDataSize + 4 + len(cert.ProofData)
+	wantSize := 32 + wire.PublicDataSizeV2 + 4 + len(cert.ProofData)
 	require.Equal(t, wantSize, buf.Len())
 	require.Equal(t, wantSize, cert.SerializedSize())
 
-	deserialized := &wire.MoECertificate{}
+	deserialized := &wire.CertificateV2{}
 	require.NoError(t, deserialized.Deserialize(bytes.NewReader(buf.Bytes())),
 		"deserialization should succeed")
 
@@ -220,19 +220,19 @@ func TestMoECertificate_SerializeDeserialize(t *testing.T) {
 	require.Equal(t, cert.ProofData, deserialized.ProofData)
 }
 
-func TestMoECertificate_ProofCommitmentDeterministic(t *testing.T) {
+func TestCertificateV2_ProofCommitmentDeterministic(t *testing.T) {
 	cert := newTestMoECert()
 	require.Equal(t, cert.ProofCommitment(), cert.ProofCommitment(),
 		"commitment must be deterministic")
 }
 
-// TestMoECertificate_ProofCommitmentVersioned ensures the commitment binds to
+// TestCertificateV2_ProofCommitmentVersioned ensures the commitment binds to
 // the certificate version: an MoE certificate and a ZK certificate with
 // identical PublicData must produce different commitments.
-func TestMoECertificate_ProofCommitmentVersioned(t *testing.T) {
+func TestCertificateV2_ProofCommitmentVersioned(t *testing.T) {
 	moe := newTestMoECert()
 
-	var zk wire.ZKCertificate
+	var zk wire.CertificateV1
 	zk.Hash = moe.Hash
 	copy(zk.PublicData[:], moe.PublicData[:])
 
@@ -240,16 +240,16 @@ func TestMoECertificate_ProofCommitmentVersioned(t *testing.T) {
 		"ZK and MoE commitments over identical PublicData must differ by version")
 }
 
-func TestMoECertificate_DeserializeProofTooLarge(t *testing.T) {
+func TestCertificateV2_DeserializeProofTooLarge(t *testing.T) {
 	var buf bytes.Buffer
 	var hash chainhash.Hash
 	_, _ = buf.Write(hash[:])
-	var pub [wire.MoEPublicDataSize]byte
+	var pub [wire.PublicDataSizeV2]byte
 	_, _ = buf.Write(pub[:])
 	// Claim a proof length above the maximum without writing the bytes.
-	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(wire.MaxMoEProofSize+1)))
+	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(wire.MaxProofSizeV2+1)))
 
-	cert := &wire.MoECertificate{}
+	cert := &wire.CertificateV2{}
 	require.Error(t, cert.Deserialize(bytes.NewReader(buf.Bytes())),
 		"oversized proof must be rejected")
 }
@@ -258,7 +258,7 @@ func TestMsgCertificate_MoE_RoundTrip(t *testing.T) {
 	cert := newTestMoECert()
 
 	msg := &wire.MsgCertificate{Certificate: cert}
-	require.Equal(t, wire.CertificateVersionMoE, msg.Certificate.Version())
+	require.Equal(t, wire.CertificateVersionV2, msg.Certificate.Version())
 
 	var buf bytes.Buffer
 	require.NoError(t, msg.PrlEncode(&buf, wire.ProtocolVersion), "encoding should succeed")
@@ -270,9 +270,9 @@ func TestMsgCertificate_MoE_RoundTrip(t *testing.T) {
 	require.NoError(t, decoded.PrlDecode(bytes.NewReader(buf.Bytes()), wire.ProtocolVersion),
 		"decoding should succeed")
 
-	require.Equal(t, wire.CertificateVersionMoE, decoded.Certificate.Version())
-	decodedMoE, ok := decoded.Certificate.(*wire.MoECertificate)
-	require.True(t, ok, "decoded certificate should be *MoECertificate")
+	require.Equal(t, wire.CertificateVersionV2, decoded.Certificate.Version())
+	decodedMoE, ok := decoded.Certificate.(*wire.CertificateV2)
+	require.True(t, ok, "decoded certificate should be *CertificateV2")
 	require.Equal(t, cert.Hash, decodedMoE.Hash)
 	require.Equal(t, cert.PublicData, decodedMoE.PublicData)
 	require.Equal(t, cert.ProofData, decodedMoE.ProofData)
@@ -281,7 +281,7 @@ func TestMsgCertificate_MoE_RoundTrip(t *testing.T) {
 func TestMsgCertificate_UnknownVersion(t *testing.T) {
 	// A version that is neither Null, ZK, nor MoE must fail to decode.
 	var buf bytes.Buffer
-	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(wire.CertificateVersionMoE+1)))
+	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(wire.CertificateVersionV2+1)))
 
 	decoded := &wire.MsgCertificate{}
 	require.Error(t, decoded.PrlDecode(bytes.NewReader(buf.Bytes()), wire.ProtocolVersion),
@@ -305,9 +305,9 @@ func TestIsCertVersionAllowed(t *testing.T) {
 		allowed bool
 	}{
 		{wire.CertificateVersionNull, false},
-		{wire.CertificateVersionZK, true},
-		{wire.CertificateVersionMoE, true},
-		{wire.CertificateVersionMoE + 1, false},
+		{wire.CertificateVersionV1, true},
+		{wire.CertificateVersionV2, true},
+		{wire.CertificateVersionV2 + 1, false},
 	}
 	for _, tt := range tests {
 		require.Equalf(t, tt.allowed, wire.IsCertVersionAllowed(tt.version),

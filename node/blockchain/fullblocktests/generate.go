@@ -1406,10 +1406,10 @@ func Generate(includeLargeReorg bool) (tests [][]TestInstance, err error) {
 	b46a := g.nextBlock("b46a", outs[14])
 	{
 		origHash := b46a.BlockHash()
-		// Set a ZKCertificate with ProofData exceeding MaxSize
+		// Set a CertificateV1 with ProofData exceeding MaxSize
 		oversizedProof := make([]byte, wire.CertificateMaxSize+1)
 		b46a.MsgHeader.MsgCertificate = wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      b46a.BlockHash(),
 				ProofData: oversizedProof,
 			},

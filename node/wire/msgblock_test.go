@@ -222,7 +222,7 @@ func TestBlockWireErrors(t *testing.T) {
 	}{
 		// Force error in certificate version (first 4 bytes).
 		{&blockOne, blockOneBytes, pver, BaseEncoding, 0, io.ErrShortWrite, io.EOF},
-		// Force error in header version (after 212-byte ZKCertificate, at offset 212).
+		// Force error in header version (after 212-byte CertificateV1, at offset 212).
 		{&blockOne, blockOneBytes, pver, BaseEncoding, 212, io.ErrShortWrite, io.EOF},
 		// Force error in prev block hash (partial read).
 		{&blockOne, blockOneBytes, pver, BaseEncoding, 220, io.ErrShortWrite, io.ErrUnexpectedEOF},
@@ -342,7 +342,7 @@ func TestBlockSerializeErrors(t *testing.T) {
 	}{
 		// Force error in certificate version.
 		{&blockOne, blockOneBytes, 0, io.ErrShortWrite, io.EOF},
-		// Force error in header version (after 212-byte ZKCertificate).
+		// Force error in header version (after 212-byte CertificateV1).
 		{&blockOne, blockOneBytes, 212, io.ErrShortWrite, io.EOF},
 		// Force error in prev block hash (partial read).
 		{&blockOne, blockOneBytes, 220, io.ErrShortWrite, io.ErrUnexpectedEOF},
@@ -492,7 +492,7 @@ func TestBlockSerializeSize(t *testing.T) {
 		in   *MsgBlock // Block to encode
 		size int       // Expected serialized size
 	}{
-		// Block with no transactions: 212 (ZKCertificate with 8-byte proof) + 108 (header) + 1 (varint tx count)
+		// Block with no transactions: 212 (CertificateV1 with 8-byte proof) + 108 (header) + 1 (varint tx count)
 		{noTxBlock, 321},
 
 		// First block in the mainnet block chain: 212 (cert) + 108 (header) + 1 (varint) + 134 (tx)
@@ -511,7 +511,7 @@ func TestBlockSerializeSize(t *testing.T) {
 }
 
 // blockOne is the first block in the mainnet block chain.
-// Uses ZKCertificate with sample data for wire encoding tests (mainnet format).
+// Uses CertificateV1 with sample data for wire encoding tests (mainnet format).
 var blockOne = MsgBlock{
 	MsgHeader: MsgHeader{
 		BlockHeader: BlockHeader{
@@ -533,7 +533,7 @@ var blockOne = MsgBlock{
 			Bits:      0x1d00ffff,               // 486604799
 		},
 		MsgCertificate: MsgCertificate{
-			Certificate: &ZKCertificate{
+			Certificate: &CertificateV1{
 				Hash: chainhash.Hash([chainhash.HashSize]byte{
 					0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 					0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,

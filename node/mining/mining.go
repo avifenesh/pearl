@@ -654,7 +654,7 @@ mempoolLoop:
 		Bits:       reqDifficulty,
 	}}
 	msgBlock.MsgHeader.MsgCertificate = wire.MsgCertificate{
-		Certificate: &wire.ZKCertificate{
+		Certificate: &wire.CertificateV1{
 			Hash: msgBlock.BlockHash(),
 		},
 	}

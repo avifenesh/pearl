@@ -842,7 +842,7 @@ func BenchmarkDecodeGetHeaders(b *testing.B) {
 
 // BenchmarkDecodeHeaders performs a benchmark on how long it takes to
 // decode a headers message with the maximum number of headers.
-// Uses ZKCertificate with realistic 50KB+ proof data to simulate production workloads.
+// Uses CertificateV1 with realistic 50KB+ proof data to simulate production workloads.
 func BenchmarkDecodeHeaders(b *testing.B) {
 	b.ReportAllocs()
 
@@ -861,9 +861,9 @@ func BenchmarkDecodeHeaders(b *testing.B) {
 			b.Fatalf("NewHashFromStr: unexpected error: %v", err)
 		}
 		bh := NewBlockHeader(1, hash, hash, 0)
-		cert := &ZKCertificate{
+		cert := &CertificateV1{
 			Hash:       bh.BlockHash(),
-			PublicData: [PublicDataSize]byte{},
+			PublicData: [PublicDataSizeV1]byte{},
 			ProofData:  proofData,
 		}
 		m.AddBlockHeader(*bh, cert)

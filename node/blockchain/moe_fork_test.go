@@ -67,9 +67,9 @@ func TestMoEForkActivationAcceptsRequiredVersion(t *testing.T) {
 		block, _, err := addBlock(chain, tip, nil)
 		require.NoErrorf(t, err, "block at height %d should be accepted", h)
 
-		want := wire.CertificateVersionZK
+		want := wire.CertificateVersionV1
 		if h >= moeForkTestHeight {
-			want = wire.CertificateVersionMoE
+			want = wire.CertificateVersionV2
 		}
 		require.Equalf(t, want, block.MsgBlock().BlockCertificate().Version(),
 			"unexpected certificate version at height %d", h)
@@ -100,7 +100,7 @@ func TestMoEForkActivationRejectsMoEBeforeFork(t *testing.T) {
 	}
 
 	bad := newBlockForcedCert(t, chain, tip,
-		&wire.MoECertificate{ProofData: []byte{0x00}})
+		&wire.CertificateV2{ProofData: []byte{0x00}})
 	_, _, err = chain.ProcessBlock(bad, BFNone)
 	requireRuleError(t, err, ErrDisallowedCertVersion)
 
@@ -128,7 +128,7 @@ func TestMoEForkActivationRejectsZKAtFork(t *testing.T) {
 	}
 
 	bad := newBlockForcedCert(t, chain, tip,
-		&wire.ZKCertificate{ProofData: []byte{0x00}})
+		&wire.CertificateV1{ProofData: []byte{0x00}})
 	_, _, err = chain.ProcessBlock(bad, BFNone)
 	requireRuleError(t, err, ErrDisallowedCertVersion)
 
@@ -144,12 +144,12 @@ func TestSolveBlockSelectsVersionSimNet(t *testing.T) {
 
 	cert, err := SolveBlock(header, &params, moeForkTestHeight-1)
 	require.NoError(t, err)
-	require.Equal(t, wire.CertificateVersionZK, cert.Version(),
+	require.Equal(t, wire.CertificateVersionV1, cert.Version(),
 		"pre-fork height must use the ZK certificate")
 
 	cert, err = SolveBlock(header, &params, moeForkTestHeight)
 	require.NoError(t, err)
-	require.Equal(t, wire.CertificateVersionMoE, cert.Version(),
+	require.Equal(t, wire.CertificateVersionV2, cert.Version(),
 		"at/after fork height must use the MoE certificate")
 }
 
@@ -159,8 +159,8 @@ func TestCheckCertificateVersion(t *testing.T) {
 	enabled := &chaincfg.Params{MoEForkHeight: moeForkTestHeight}
 	disabled := &chaincfg.Params{MoEForkHeight: 0}
 
-	zk := &wire.ZKCertificate{}
-	moe := &wire.MoECertificate{}
+	zk := &wire.CertificateV1{}
+	moe := &wire.CertificateV2{}
 
 	// Disabled fork: ZK always valid, MoE never valid.
 	require.NoError(t, CheckCertificateVersion(zk, 1_000_000, disabled))
