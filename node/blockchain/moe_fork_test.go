@@ -153,6 +153,42 @@ func TestSolveBlockSelectsVersionSimNet(t *testing.T) {
 		"at/after fork height must use the MoE certificate")
 }
 
+// TestMoEForkBlockTemplateVersion verifies CheckConnectBlockTemplate enforces
+// the version cutover for block templates: at the fork height a V2 template is
+// accepted and a V1 template is rejected. This is the contract the height-aware
+// mining template selection (mining.NewBlockTemplate) is built to satisfy.
+func TestMoEForkBlockTemplateVersion(t *testing.T) {
+	params := moeSimNetParams()
+	chain, teardown, err := chainSetup("moe_fork_template", &params)
+	require.NoError(t, err)
+	defer teardown()
+
+	tip := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+	tip.SetHeight(0)
+
+	// Extend with valid V1 blocks so a template built on the tip lands
+	// exactly at the fork height.
+	for h := int32(1); h <= moeForkTestHeight-1; h++ {
+		block, _, err := addBlock(chain, tip, nil)
+		require.NoError(t, err)
+		tip = block
+	}
+
+	// A template at the fork height must carry V2 (SolveBlock selects it).
+	v2Template, _, err := newBlock(chain, tip, nil)
+	require.NoError(t, err)
+	require.Equal(t, wire.CertificateVersionV2,
+		v2Template.MsgBlock().BlockCertificate().Version())
+	require.NoError(t, chain.CheckConnectBlockTemplate(v2Template),
+		"V2 template must be accepted at the fork height")
+
+	// The same template carrying a V1 certificate must be rejected.
+	v1Template := newBlockForcedCert(t, chain, tip,
+		&wire.CertificateV1{ProofData: []byte{0x00}})
+	requireRuleError(t, chain.CheckConnectBlockTemplate(v1Template),
+		ErrDisallowedCertVersion)
+}
+
 // TestCheckCertificateVersion exercises the policy helper directly, including
 // the disabled-fork case and the nil-certificate guard.
 func TestCheckCertificateVersion(t *testing.T) {
