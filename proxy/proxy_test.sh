@@ -97,7 +97,8 @@ localhost:${PROXY_PORT} {
 		}
 	}
 
-	jsonrpc_cache {
+	jsonrpc {
+		allow {env.RPC_ALLOWED_METHODS}
 		cache getblocktemplate 3s
 	}
 
@@ -111,6 +112,7 @@ docker build -t pearld-proxy proxy/ -q 2>&1
 echo "[setup] Starting proxy container..."
 docker run -d --name "$CONTAINER_NAME" \
     -p "${PROXY_PORT}:${PROXY_PORT}" \
+    -e RPC_ALLOWED_METHODS="getblockcount getblocktemplate" \
     -v "${CADDYFILE}:/etc/caddy/Caddyfile:ro" \
     pearld-proxy > /dev/null 2>&1
 
@@ -240,7 +242,16 @@ else
     pass "GBT request after TTL is a MISS (cache expired)"
 fi
 
-# --- 10: Rate limiting (run last — exhausts the rate limit window) ---
+# --- 10: Method allowlist rejects a disallowed method ---
+echo "[test] Disallowed JSON-RPC method is rejected (HTTP 403)"
+CODE=$(rpc_code '{"jsonrpc":"1.0","method":"getpeerinfo","params":[],"id":1}')
+if [ "$CODE" = "403" ]; then
+    pass "Disallowed method getpeerinfo returns HTTP 403"
+else
+    fail "Disallowed method returned HTTP ${CODE}, expected 403"
+fi
+
+# --- 11: Rate limiting (run last — exhausts the rate limit window) ---
 echo "[test] Rate limiting (${RATE_LIMIT} req/min)"
 RATE_429=0
 for _ in $(seq 1 $((RATE_LIMIT + 10))); do

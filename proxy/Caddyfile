@@ -9,7 +9,8 @@ localhost:44107 {
 		}
 	}
 
-	jsonrpc_cache {
+	jsonrpc {
+		allow {env.RPC_ALLOWED_METHODS}
 		cache getblocktemplate 1s
 	}
 

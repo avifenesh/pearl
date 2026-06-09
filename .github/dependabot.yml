@@ -23,7 +23,7 @@ updates:
     directories:
       - "/"
       - "/tools"
-      - "/proxy/caddy-jsonrpc-cache"
+      - "/proxy/caddy-jsonrpc"
     schedule:
       interval: "monthly"
     open-pull-requests-limit: 5

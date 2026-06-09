@@ -27,8 +27,13 @@ docker run -d --name pearld \
 # Start the Caddy sidecar (shares pearld's network namespace)
 docker run -d --name proxy \
   --network=container:pearld \
+  -e RPC_ALLOWED_METHODS="getblocktemplate submitblock" \
   pearld-proxy
 ```
+
+`RPC_ALLOWED_METHODS` is read by the default `Caddyfile` to restrict which
+JSON-RPC methods the proxy forwards. It is optional — if unset, all methods are
+allowed. See [Method Allowlist](#method-allowlist).
 
 RPC is now available at `https://localhost:44107` with a self-signed certificate.
 
@@ -55,6 +60,8 @@ services:
     build:
       context: proxy/
     network_mode: "service:node"
+    environment:
+      RPC_ALLOWED_METHODS: "getblocktemplate submitblock"
     volumes:
       - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on:
@@ -124,6 +131,57 @@ rate_limit {
 }
 ```
 
+## Method Allowlist
+
+The `jsonrpc` directive can restrict which JSON-RPC methods reach the node.
+Anything not on the list is rejected with **HTTP 403** and a JSON-RPC error
+body. The default `Caddyfile` sources the list from an environment variable so
+the policy isn't baked into the config:
+
+```
+jsonrpc {
+    allow {env.RPC_ALLOWED_METHODS}
+    cache getblocktemplate 1s
+}
+```
+
+Set the methods on the **proxy** container as a whitespace- or comma-separated
+list:
+
+```bash
+docker run -d --name proxy \
+  --network=container:pearld \
+  -e RPC_ALLOWED_METHODS="getblocktemplate submitblock" \
+  pearld-proxy
+```
+
+```yaml
+# docker-compose
+proxy:
+  build: { context: proxy/ }
+  network_mode: "service:node"
+  environment:
+    RPC_ALLOWED_METHODS: "getblocktemplate submitblock"
+```
+
+Behavior when an allowlist is configured:
+
+- Only POST requests whose JSON-RPC `method` is on the list are forwarded.
+- Any other method, plus requests that aren't POST or whose body can't be
+  parsed as a JSON-RPC request, are rejected (default-deny). This closes
+  batch-array requests as an allowlist bypass.
+- **Empty means allow all**: if the `allow` directive resolves to no methods
+  (e.g. `RPC_ALLOWED_METHODS` is unset or empty), the allowlist is inactive and
+  every method is permitted. Caddy logs a warning so the case stays visible, but
+  it does not refuse to start.
+- `{env.VAR}` is resolved at startup, so changing the list requires a container
+  restart. The value may be whitespace- or comma-separated.
+
+You can also list methods literally (`allow getblocktemplate submitblock`),
+repeat the directive across lines, or mix both forms. When no `allow` line is
+present at all, every method is permitted (the cache still applies to
+configured methods).
+
 ## Kubernetes Deployment
 
 In Kubernetes, containers in the same Pod share a network namespace by default.
@@ -163,6 +221,9 @@ spec:
 
     - name: proxy
       image: ghcr.io/pearl-research-labs/pearld-proxy:latest
+      env:
+        - name: RPC_ALLOWED_METHODS
+          value: "getblocktemplate submitblock"
       ports:
         - containerPort: 44107
           name: rpc-tls
@@ -201,8 +262,8 @@ spec:
 
 ## Testing
 
-The smoke test script validates TLS, auth, rate limiting, and caching against
-any running Pearl node:
+The smoke test script validates TLS, auth, rate limiting, caching, and the
+method allowlist against any running Pearl node:
 
 ```bash
 ./proxy/proxy_test.sh \
@@ -212,13 +273,13 @@ any running Pearl node:
 ```
 
 The script builds the proxy image, starts a Caddy container pointing at the
-given node, runs 10 tests, and tears down. It works with any reachable node
+given node, runs 11 tests, and tears down. It works with any reachable node
 (testnet, mainnet, or local).
 
-The `caddy-jsonrpc-cache` plugin also has Go unit tests:
+The `caddy-jsonrpc` plugin also has Go unit tests:
 
 ```bash
-cd proxy/caddy-jsonrpc-cache && go test ./...
+cd proxy/caddy-jsonrpc && go test ./...
 ```
 
 ## Building with Plugins
@@ -226,7 +287,7 @@ cd proxy/caddy-jsonrpc-cache && go test ./...
 The proxy Dockerfile builds a custom Caddy binary via `xcaddy` with two plugins:
 
 - [`caddy-ratelimit`](https://github.com/mholt/caddy-ratelimit) — per-IP rate limiting
-- `caddy-jsonrpc-cache` (local module in `caddy-jsonrpc-cache/`) — JSON-RPC method-aware response caching
+- `caddy-jsonrpc` (local module in `caddy-jsonrpc/`) — JSON-RPC method allowlisting and method-aware response caching
 
 To add additional Caddy plugins, append `--with` flags in the Dockerfile's
 `xcaddy build` command.

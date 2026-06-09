@@ -1,4 +1,4 @@
-package jsonrpccache
+package jsonrpc
 
 import (
 	"time"
@@ -10,8 +10,8 @@ import (
 )
 
 func init() {
-	httpcaddyfile.RegisterHandlerDirective("jsonrpc_cache", parseCaddyfile)
-	httpcaddyfile.RegisterDirectiveOrder("jsonrpc_cache", "before", "reverse_proxy")
+	httpcaddyfile.RegisterHandlerDirective("jsonrpc", parseCaddyfile)
+	httpcaddyfile.RegisterDirectiveOrder("jsonrpc", "before", "reverse_proxy")
 }
 
 // parseCaddyfile unmarshals tokens from h into a new Handler.
@@ -23,9 +23,15 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler. Syntax:
 //
-//	jsonrpc_cache {
+//	jsonrpc {
+//	    allow <method> [<method>...]
 //	    cache <method> <ttl>
 //	}
+//
+// allow may be repeated; methods accumulate across lines. Each argument may be
+// a Caddy placeholder such as {env.RPC_ALLOWED_METHODS}, which is resolved (and
+// split on whitespace/commas) in Provision. When no allow directive is present —
+// or it resolves to nothing — every method is permitted.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		if d.NextArg() {
@@ -34,6 +40,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 		for nesting := d.Nesting(); d.NextBlock(nesting); {
 			switch d.Val() {
+			case "allow":
+				args := d.RemainingArgs()
+				if len(args) == 0 {
+					return d.ArgErr()
+				}
+				h.Allow = append(h.Allow, args...)
 			case "cache":
 				args := d.RemainingArgs()
 				if len(args) != 2 {
