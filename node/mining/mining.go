@@ -653,11 +653,16 @@ mempoolLoop:
 		Timestamp:  ts,
 		Bits:       reqDifficulty,
 	}}
-	msgBlock.MsgHeader.MsgCertificate = wire.MsgCertificate{
-		Certificate: &wire.CertificateV1{
-			Hash: msgBlock.BlockHash(),
-		},
+	// Use a certificate placeholder whose version matches what consensus
+	// requires at this height, so CheckConnectBlockTemplate (which enforces
+	// the version cutover) accepts the template at and after the fork height.
+	var certificate wire.BlockCertificate
+	if g.chainParams.IsMoEForkActive(nextBlockHeight) {
+		certificate = &wire.CertificateV2{Hash: msgBlock.BlockHash()}
+	} else {
+		certificate = &wire.CertificateV1{Hash: msgBlock.BlockHash()}
 	}
+	msgBlock.MsgHeader.MsgCertificate = wire.MsgCertificate{Certificate: certificate}
 	for _, tx := range blockTxns {
 		if err := msgBlock.AddTransaction(tx.MsgTx()); err != nil {
 			return nil, err
