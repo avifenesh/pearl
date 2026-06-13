@@ -52,14 +52,21 @@ class InnerHasher:
 
         self.num_tiles_hashed += num_tiles_h * num_tiles_w
 
-        hashes = []
+        # Vectorized per-tile XOR reduction: reshape into a (nh, nw, tile_h*tile_w)
+        # grid and XOR-reduce the flattened tile axis in one numpy op, instead of
+        # a Python double loop with a slice + reduce + object per tile. This is
+        # bit-identical to the per-tile xor_reduction loop (the tiles cover the
+        # full-tile region [: nh*tile_h, : nw*tile_w] in the same row/col order).
+        cropped = tensor[: num_tiles_h * self.tile_h, : num_tiles_w * self.tile_w]
+        grid = (
+            cropped.reshape(num_tiles_h, self.tile_h, num_tiles_w, self.tile_w)
+            .permute(0, 2, 1, 3)
+            .reshape(num_tiles_h, num_tiles_w, self.tile_h * self.tile_w)
+        )
+        tile_hashes = np.bitwise_xor.reduce(grid.numpy().view(np.uint32), axis=2)
 
-        for i in range(num_tiles_h):
-            for j in range(num_tiles_w):
-                tile = tensor[
-                    i * self.tile_h : (i + 1) * self.tile_h,
-                    j * self.tile_w : (j + 1) * self.tile_w,
-                ]
-                hashes.append(hash_tile(tile, (i, j)))
-
-        return hashes
+        return [
+            InnerHashResult(hash=tile_hashes[i, j], index=(i, j))
+            for i in range(num_tiles_h)
+            for j in range(num_tiles_w)
+        ]

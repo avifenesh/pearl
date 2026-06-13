@@ -284,6 +284,19 @@ def _unimplemented(name):
 noise_A = _unimplemented("noise_A")
 noise_B = _unimplemented("noise_B")
 denoise_converter = _unimplemented("denoise_converter")
-inner_hash = _unimplemented("inner_hash")
 build_routing_data = _unimplemented("build_routing_data")
 get_build_routing_data_scratchpad_bytes = _unimplemented("get_build_routing_data_scratchpad_bytes")
+
+
+def inner_hash(input_buffer, iterations=1):
+    """XOR-reduce a 1D uint32 buffer to a single uint32 (mirrors inner_hash kernel).
+
+    iterations=1 is the standard hash; iterations>1 repeats it (stress/timing
+    path in the kernel) — we just recompute, which matches the deterministic
+    single-hash result the tests check.
+    """
+    import numpy as _np
+
+    arr = input_buffer.detach().cpu().flatten().numpy().view(_np.uint32)
+    h = _np.bitwise_xor.reduce(arr)
+    return torch.tensor([h], dtype=torch.uint32, device=input_buffer.device)
