@@ -8,6 +8,7 @@ Manages an async thread for this miner process, which handles several tasks:
 """
 
 import asyncio
+import os
 import threading
 import time
 import warnings
@@ -38,6 +39,45 @@ class CudaEventQueueItem:
 
     cuda_event: torch.cuda.Event
     callback: Callable[[], None]
+    enqueued_at: float = 0.0  # perf_counter at schedule time (profiling only)
+
+
+# Opt-in submission-consumer profiling (PEARL_PROFILE_SUBMISSION). Records, per
+# consumer wakeup, how many items were drained and the enqueue->drained latency.
+_PROFILE_SUBMISSION = os.getenv("PEARL_PROFILE_SUBMISSION", "").lower() in ("1", "true", "yes")
+
+
+@dataclass
+class _SubmissionProfile:
+    """Counters for the single async submission consumer (profiling only)."""
+
+    drained: int = 0
+    total_latency_s: float = 0.0
+    max_latency_s: float = 0.0
+    total_sleeps: int = 0  # how many 10ms sleeps the head item incurred
+    items_with_sleep: int = 0  # items that had to wait at least one poll
+    max_queue_after: int = 0  # backlog still queued after draining this item
+
+    def record(self, latency_s: float, sleeps: int, queue_after: int) -> None:
+        self.drained += 1
+        self.total_latency_s += latency_s
+        if latency_s > self.max_latency_s:
+            self.max_latency_s = latency_s
+        self.total_sleeps += sleeps
+        if sleeps:
+            self.items_with_sleep += 1
+        if queue_after > self.max_queue_after:
+            self.max_queue_after = queue_after
+
+    def summary(self) -> str:
+        avg_ms = (self.total_latency_s / self.drained * 1000.0) if self.drained else 0.0
+        return (
+            f"[submission profile] drained={self.drained} "
+            f"avg_enqueue_to_drain={avg_ms:.3f}ms "
+            f"max={self.max_latency_s * 1000.0:.3f}ms "
+            f"items_needing_poll={self.items_with_sleep} total_10ms_sleeps={self.total_sleeps} "
+            f"max_backlog_after_drain={self.max_queue_after}"
+        )
 
 
 def _make_client(miner_settings: MinerSettings, config: MinerRpcConfig) -> MiningClient:
@@ -161,9 +201,12 @@ class AsyncLoopManager:
             return
         assert self._cuda_event_queue, "Status check queue not initialized"
         self._pending_cuda_events += 1
+        enqueued_at = time.perf_counter() if _PROFILE_SUBMISSION else 0.0
         self._loop.call_soon_threadsafe(
             self._cuda_event_queue.put_nowait,
-            CudaEventQueueItem(cuda_event=cuda_event, callback=callback),
+            CudaEventQueueItem(
+                cuda_event=cuda_event, callback=callback, enqueued_at=enqueued_at
+            ),
         )
 
     def wait_until_done_submitting_blocks(self) -> None:
@@ -223,6 +266,7 @@ class AsyncLoopManager:
             await asyncio.sleep(1.0)  # Update every second
 
     async def _process_cuda_events_loop(self) -> None:
+        prof = _SubmissionProfile() if _PROFILE_SUBMISSION else None
         while not self._stop_event.is_set():
             try:
                 item = await asyncio.wait_for(self._cuda_event_queue.get(), timeout=10)
@@ -230,8 +274,17 @@ class AsyncLoopManager:
                 # check the stop event
                 continue
 
+            sleeps = 0
             while not item.cuda_event.query():
                 await asyncio.sleep(0.01)
+                sleeps += 1
+
+            if prof is not None:
+                prof.record(
+                    latency_s=time.perf_counter() - item.enqueued_at,
+                    sleeps=sleeps,
+                    queue_after=self._cuda_event_queue.qsize(),
+                )
 
             # callback should be fast (setup and call `handle_submit_block`)
             try:
@@ -241,6 +294,8 @@ class AsyncLoopManager:
             finally:
                 self._pending_cuda_events -= 1
 
+        if prof is not None:
+            _LOGGER.info(prof.summary())
         _LOGGER.info("Status check polling loop stopped")
 
     def __del__(self) -> None:
