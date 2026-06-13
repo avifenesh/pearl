@@ -2,7 +2,18 @@
 pearl_gemm package
 
 This package provides CUDA kernels for Pearl GEMM with noising/denoising and PoW extraction.
+
+On hosts without the compiled ``pearl_gemm_cuda`` extension (e.g. non-sm_90 dev
+machines), a pure-Python reference backend is installed as ``pearl_gemm_cuda``
+so the package still imports and the mining path runs (bit-exact for PoW, NOT
+performance-representative). Force the reference with ``PEARL_GEMM_REFERENCE=1``.
 """
+
+from . import _reference_cuda as _reference_cuda
+
+# Install the reference backend if the real CUDA extension is unavailable
+# (or when explicitly forced). The real extension always wins otherwise.
+_reference_cuda.install()
 
 # Re-export pearl_gemm_cuda utilities for cleaner API
 from pearl_gemm_cuda import (
