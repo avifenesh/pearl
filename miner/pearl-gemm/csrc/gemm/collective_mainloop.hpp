@@ -222,16 +222,21 @@ struct CollectiveMainloop {
           // so this branch is never instantiated and the stock path is unchanged).
           //
           // Here tBgB points at the RAW weights B (see pearl_gemm_host.h). We must
-          // turn the just-loaded raw-B tile in sB(stage) into the noised
-          //     BpEB = B + E_B,   E_B = int8( EBL(bK,R) * EBR(R,bN) )
-          // IN PLACE, in the swizzled SmemLayoutB the WGMMA consumer reads.
+          // turn the just-loaded raw-B tile in sB(stage) into the noised BpEB,
+          // IN PLACE, in the swizzled SmemLayoutB the WGMMA consumer reads:
+          //     BpEB = B + E_B,   E_B = EBL(bK,R) * EBR(R,bN)
+          // NOTE: E_B is GENERATED IN-RANGE: the reference asserts the noise lies in
+          // [-noise_range/2, noise_range/2] = [-64, 64] (NoiseGenerator guarantees this),
+          // so the int32->int8 narrowing is exact, NOT a wrap. Do not implement wrapping;
+          // rely on the in-range invariant (verified in validate_fused_B.py).
           //
           // Plan (compute once per n-block, hold E_B factors in SMEM):
           //   1. Stage EBL (k,R) and EBR (R,n) tiles for this (n_block,k_tile) into
           //      SMEM scratch (added to SharedStorage; EBR per n-block reused over m,
           //      EBL per k-tile). Pointers: mainloop_params.ptr_EBL_R_major / ptr_EBR.
           //   2. A dedicated noise warpgroup computes E_B = EBL*EBR via int8*int8->int32
-          //      WGMMA, truncates to int8 (wrap, matching miner_base.noise_B), and
+          //      WGMMA, narrows int32->int8 (exact, in-range per the note above,
+          //      matching miner_base.noise_B), and
           //      adds into sB(stage) through the same swizzle write path noisingB uses
           //      to build BpEB (R2SCopyAtom + the half-MMA layout-recover trick), but
           //      writing the SWIZZLED SmemLayoutB rather than the store layout.
