@@ -177,6 +177,19 @@ struct KernelTraits {
 
   static_assert(R % 16 == 0);  // needed for this MMA op
 
+  // --- B' fusion: int8 EBL/EBR SMEM layouts (separate from the fp16 denoise
+  // factors above) for forming BpEB = B + int8(EBL*EBR) on-chip. ---
+  using SmemLayoutEBLi8_Atom =
+      decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+               GMMA::Major::K, ElementIn, Int<bK>, Int<R>>());
+  using SmemLayoutEBLi8 = decltype(tile_to_shape(
+      SmemLayoutEBLi8_Atom{}, Shape<Int<bK>, Int<R>, Int<kStages>>{}));
+  using SmemLayoutEBRi8_Atom =
+      decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+               GMMA::Major::K, ElementIn, Int<bN>, Int<R>>());
+  using SmemLayoutEBRi8 = decltype(tile_to_shape(
+      SmemLayoutEBRi8_Atom{}, Shape<Int<bN>, Int<R>>{}));
+
   // NOTE if you change these, also change the pipeline stages heuristic in
   // heuristics.hpp!
   struct SharedStorageDenoise : cute::aligned_struct<128> {
@@ -230,6 +243,16 @@ struct KernelTraits {
                             SmemLayoutScaleB{})>
         smem_scale_b;
 
+#ifdef PEARL_FUSE_NOISE_B
+    // B' fusion: int8 EBL/EBR staged for on-chip BpEB = B + int8(EBL*EBR).
+    cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBLi8>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayoutEBLi8{})>
+        smem_EBLi8;
+    cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBRi8>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayoutEBRi8{})>
+        smem_EBRi8;
+#endif
+
     struct {
       typename MainloopPipeline::SharedStorage pipeline;
       typename DenoisePipeline::SharedStorage AxEB_pipeline;
@@ -259,6 +282,16 @@ struct KernelTraits {
                         cutlass::detail::alignment_for_swizzle(
                             SmemLayoutScaleB{})>
         smem_scale_b;
+
+#ifdef PEARL_FUSE_NOISE_B
+    // B' fusion: int8 EBL/EBR staged for on-chip BpEB = B + int8(EBL*EBR).
+    cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBLi8>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayoutEBLi8{})>
+        smem_EBLi8;
+    cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBRi8>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayoutEBRi8{})>
+        smem_EBRi8;
+#endif
 
     struct {
       typename MainloopPipeline::SharedStorage pipeline;

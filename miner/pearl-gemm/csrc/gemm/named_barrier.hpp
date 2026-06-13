@@ -19,5 +19,6 @@ enum class NamedBarriers {
   DenoiseConvertEAxBpEBWrite = 8,
   Epilogue = 9,
   LoadScales = 10,
+  S2RCopyBDone = 11,  // B' fusion: sB read/write sync in fuse_noise_b_inplace
 };
 }

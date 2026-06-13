@@ -894,10 +894,13 @@ void noisy_gemm(
                     // B' fusion: the main GEMM forms BpEB on-chip, so the
                     // separate noising_B kernel (which materializes BpEB to HBM)
                     // is skipped. EARxBpEB is produced inside the fused GEMM.
-                    if (!pearl::kFuseNoiseB) {
-                      run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_,
-                                           stages_>(params, stream);
-                    });
+                    kernel_found_noising_b = true;
+                    // B' fusion candidate-1 (PARTIAL): keep noising_B running so
+                    // EARxBpEB stays correct; the GEMM re-derives BpEB on-chip and
+                    // ignores the HBM BpEB. Proves the on-chip path bit-exact.
+                    // candidate-2 will drop this launch and form EARxBpEB in-GEMM.
+                    run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_,
+                                         stages_>(params, stream););
               } else { kernel_found_noising_b = true; }
 
               if (do_denoise_conversion) {

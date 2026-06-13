@@ -65,6 +65,7 @@ struct CollectiveMainloop {
       take<0, 2>(SmemLayoutB{}), select<1, 2>(TileShape_MNK{}), kClusterSizeM));
 
   static constexpr int kNumMmaThreads = KTraits::kNumMmaThreads;
+  static constexpr bool FuseNoiseB = KTraits::FuseNoiseB;
   using MainloopPipeline = typename KTraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;
@@ -119,6 +120,24 @@ struct CollectiveMainloop {
   using S2RCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, uint16_t>;
   using R2SCopyAtomB = Copy_Atom<SM90_U32x4_STSM_N, uint16_t>;
 
+  // TMA loaders for the int8 noise factors (only used when FuseNoiseB).
+  using TMA_EBL = decltype(make_tma_copy(
+      cute::SM90_TMA_LOAD{},
+      make_tensor(make_gmem_ptr(static_cast<ElementIn const*>(nullptr)),
+                  ShapeT{}, StrideT{}),
+      take<0, 2>(SmemLayoutEBL{}),
+      cute::Shape<cute::Int<KTraits::bK>, cute::Int<R>>{}, _1{}));
+  using TMA_EBR = decltype(make_tma_copy(
+      cute::SM90_TMA_LOAD{},
+      make_tensor(make_gmem_ptr(static_cast<ElementIn const*>(nullptr)),
+                  ShapeT{}, StrideT{}),
+      SmemLayoutEBR{},
+      cute::Shape<cute::Int<KTraits::bN>, cute::Int<R>>{}, _1{}));
+  static constexpr uint32_t TmaTransactionBytesEBL = static_cast<uint32_t>(
+      size(take<0, 2>(SmemLayoutEBL{})) * cutlass::sizeof_bits_v<ElementIn> / 8);
+  static constexpr uint32_t TmaTransactionBytesEBR = static_cast<uint32_t>(
+      size(SmemLayoutEBR{}) * cutlass::sizeof_bits_v<ElementIn> / 8);
+
   struct Arguments {
     ElementIn const* ptr_A;
     ElementIn const* ptr_B;
@@ -150,6 +169,10 @@ struct CollectiveMainloop {
     uint32_t const* ptr_pow_key;
     ElementIn const* ptr_EBL_R_major = nullptr;  // (k, R), only when kFuseNoiseB
     ElementIn const* ptr_EBR = nullptr;          // (R, n), only when kFuseNoiseB
+    LayoutT layout_EBL;
+    LayoutT layout_EBR;
+    TMA_EBL tma_load_EBL;
+    TMA_EBR tma_load_EBR;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -168,6 +191,24 @@ struct CollectiveMainloop {
         make_tma_copy(TMAOpB{}, mB, SmemLayoutB{}(_, _, _0{}),
                       select<1, 2>(TileShape_MNK{}), kClusterSizeM);
 
+    // B' fusion noise-factor TMA loaders. Built unconditionally (cheap, types
+    // must exist); only used when FuseNoiseB and the pointers are non-null.
+    LayoutT layout_EBL =
+        make_layout(make_shape(K, (int32_t)R), make_stride((int32_t)R, _1{}));
+    LayoutT layout_EBR =
+        make_layout(make_shape(N, (int32_t)R), make_stride((int32_t)R, _1{}));
+    ElementIn const* ebl_ptr =
+        args.ptr_EBL_R_major ? args.ptr_EBL_R_major : args.ptr_B;
+    ElementIn const* ebr_ptr = args.ptr_EBR ? args.ptr_EBR : args.ptr_B;
+    Tensor mEBL = make_tensor(make_gmem_ptr(ebl_ptr), layout_EBL);
+    TMA_EBL tma_load_EBL = make_tma_copy(
+        cute::SM90_TMA_LOAD{}, mEBL, take<0, 2>(SmemLayoutEBL{}),
+        cute::Shape<cute::Int<KTraits::bK>, cute::Int<R>>{}, _1{});
+    Tensor mEBR = make_tensor(make_gmem_ptr(ebr_ptr), layout_EBR);
+    TMA_EBR tma_load_EBR =
+        make_tma_copy(cute::SM90_TMA_LOAD{}, mEBR, SmemLayoutEBR{},
+                      cute::Shape<cute::Int<KTraits::bN>, cute::Int<R>>{}, _1{});
+
     return {.ptr_A = args.ptr_A,
             .ptr_B = args.ptr_B,
             .layout_A = layout_A,
@@ -183,7 +224,11 @@ struct CollectiveMainloop {
             .ptr_pow_target = args.ptr_pow_target,
             .ptr_pow_key = args.ptr_pow_key,
             .ptr_EBL_R_major = args.ptr_EBL_R_major,
-            .ptr_EBR = args.ptr_EBR};
+            .ptr_EBR = args.ptr_EBR,
+            .layout_EBL = layout_EBL,
+            .layout_EBR = layout_EBR,
+            .tma_load_EBL = tma_load_EBL,
+            .tma_load_EBR = tma_load_EBR};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -257,43 +302,45 @@ struct CollectiveMainloop {
              tAgA(_, k_tile), tAsA(_, stage));
         copy(mainloop_params.tma_load_B.with(*tmaBar, tma_mcast_mask_b),
              tBgB(_, k_tile), tBsB(_, stage));
-        if constexpr (KTraits::FuseNoiseB) {
-          // ===================================================================
-          // B' fusion (H100 work-in-progress; default build sets FuseNoiseB=false
-          // so this branch is never instantiated and the stock path is unchanged).
-          //
-          // Here tBgB points at the RAW weights B (see pearl_gemm_host.h). We must
-          // turn the just-loaded raw-B tile in sB(stage) into the noised BpEB,
-          // IN PLACE, in the swizzled SmemLayoutB the WGMMA consumer reads:
-          //     BpEB = B + E_B,   E_B = EBL(bK,R) * EBR(R,bN)
-          // NOTE: E_B is GENERATED IN-RANGE: the reference asserts the noise lies in
-          // [-noise_range/2, noise_range/2] = [-64, 64] (NoiseGenerator guarantees this),
-          // so the int32->int8 narrowing is exact, NOT a wrap. Do not implement wrapping;
-          // rely on the in-range invariant (verified in validate_fused_B.py).
-          //
-          // Plan (compute once per n-block, hold E_B factors in SMEM):
-          //   1. Stage EBL (k,R) and EBR (R,n) tiles for this (n_block,k_tile) into
-          //      SMEM scratch (added to SharedStorage; EBR per n-block reused over m,
-          //      EBL per k-tile). Pointers: mainloop_params.ptr_EBL_R_major / ptr_EBR.
-          //   2. A dedicated noise warpgroup computes E_B = EBL*EBR via int8*int8->int32
-          //      WGMMA, narrows int32->int8 (exact, in-range per the note above,
-          //      matching miner_base.noise_B), and
-          //      adds into sB(stage) through the same swizzle write path noisingB uses
-          //      to build BpEB (R2SCopyAtom + the half-MMA layout-recover trick), but
-          //      writing the SWIZZLED SmemLayoutB rather than the store layout.
-          //   3. EARxBpEB (denoise side-product, R x n) is then formed from the on-chip
-          //      BpEB tiles (EAR*BpEB accumulated over k) into the SMEM the epilogue
-          //      already reads via the DenoiseComplete barrier — replacing noisingB's
-          //      SMEM->HBM->SMEM with SMEM->SMEM.
-          // Validated bit-exact at the math level in validate_fused_B.py.
-          // The TMA-load+commit ordering above must be reworked so the noise WG runs
-          // between load-complete and consumer-consume (extra pipeline phase).
-          // ===================================================================
-          static_assert(KTraits::FuseNoiseB && false,
-                        "B' fusion compute block not yet implemented; build "
-                        "without PEARL_FUSE_NOISE_B (the default).");
+        if constexpr (FuseNoiseB) {
+          // Load this k-tile's EBL (bK,R) into the gated SMEM ring on the SAME
+          // mbarrier/stage as A,B so it is ready when the consumer transforms sB.
+          Tensor sEBL = make_tensor(
+              make_smem_ptr(shared_storage.smem_EBLi8.data()),
+              typename KTraits::SmemLayoutEBLi8{});
+          Tensor mEBL = mainloop_params.tma_load_EBL.get_tma_tensor(
+              mainloop_params.layout_EBL.shape());
+          Tensor gEBL = local_tile(
+              mEBL, cute::Shape<cute::Int<KTraits::bK>, cute::Int<R>>{},
+              make_coord(_, _0{}));  // (bK,R,k)
+          auto [tEgE, tEsE] = tma_partition(
+              mainloop_params.tma_load_EBL, _0{}, make_layout(_1{}),
+              group_modes<0, 2>(sEBL), group_modes<0, 2>(gEBL));
+          copy(mainloop_params.tma_load_EBL.with(*tmaBar, 0),
+               tEgE(_, k_tile), tEsE(_, stage));
+          // EBR (bN,R) is constant over k; load it once (k_tile==0) on the same
+          // mbarrier into the single-buffer gated SMEM.
+          if (k_tile == 0) {
+            Tensor sEBR = make_tensor(
+                make_smem_ptr(shared_storage.smem_EBRi8.data()),
+                typename KTraits::SmemLayoutEBRi8{});
+            Tensor mEBR = mainloop_params.tma_load_EBR.get_tma_tensor(
+                mainloop_params.layout_EBR.shape());
+            Tensor gEBR = local_tile(
+                mEBR, cute::Shape<cute::Int<KTraits::bN>, cute::Int<R>>{},
+                make_coord(n_block, _0{}));  // (bN,R)
+            auto [tRgR, tRsR] = tma_partition(
+                mainloop_params.tma_load_EBR, _0{}, make_layout(_1{}),
+                group_modes<0, 2>(sEBR), group_modes<0, 2>(gEBR));
+            copy(mainloop_params.tma_load_EBR.with(*tmaBar, 0), tRgR, tRsR);
+          }
         }
-        pipeline.producer_commit(smem_pipe_write, TmaTransactionBytes);
+        uint32_t commit_bytes = TmaTransactionBytes;
+        if constexpr (FuseNoiseB) {
+          commit_bytes += TmaTransactionBytesEBL;
+          if (k_tile == 0) commit_bytes += TmaTransactionBytesEBR;
+        }
+        pipeline.producer_commit(smem_pipe_write, commit_bytes);
         ++smem_pipe_write;
       }
     }
@@ -326,6 +373,81 @@ struct CollectiveMainloop {
           static_cast<cutlass::arch::ReservedNamedBarriers>(
               pearl::NamedBarriers::DenoiseComplete));
     }
+  }
+
+  // B' fusion: transform sB[stage] in place from raw B to BpEB = B + int8(EBL*EBR).
+  // Runs on the consumer MMA warpgroup(s) using the existing TiledMma partitioning,
+  // mirroring noising_B::compute_BpEB but writing back into the swizzled sB instead
+  // of a store-layout buffer. Must be called AFTER pipeline.consumer_wait(stage)
+  // (B + EBL present) and BEFORE the main GEMM consumes sB for this stage.
+  template <typename SharedStorage>
+  CUTLASS_DEVICE void fuse_noise_b_inplace(SharedStorage& shared_storage,
+                                           int stage, int thread_idx) {
+    Tensor sB = make_tensor(make_smem_ptr(shared_storage.smem_B.data()),
+                            SmemLayoutB{});
+    Tensor sB_pi = as_position_independent_swizzle_tensor(sB);
+    Tensor sEBR = make_tensor(make_smem_ptr(shared_storage.smem_EBRi8.data()),
+                              typename KTraits::SmemLayoutEBRi8{});
+    Tensor sEBL = make_tensor(make_smem_ptr(shared_storage.smem_EBLi8.data()),
+                              typename KTraits::SmemLayoutEBLi8{});
+
+    // WGMMA E_B = EBR * EBL -> int32 accumulator (bN, bK), as in compute_BpEB.
+    TiledMmaNoiseB tiled_mma;
+    auto thr_mma = tiled_mma.get_slice(thread_idx);
+    Tensor tCrEB = partition_fragment_C(tiled_mma,
+                                        cute::Shape<cute::Int<KTraits::bN>,
+                                                    cute::Int<KTraits::bK>>{});
+    Tensor tCrEB_int8 = make_fragment_like<ElementIn>(tCrEB);
+    Tensor tCsEBR = thr_mma.partition_A(sEBR);
+    Tensor tCrEBR = thr_mma.make_fragment_A(tCsEBR);
+    Tensor tCsEBL = thr_mma.partition_B(sEBL);
+    Tensor tCrEBL = thr_mma.make_fragment_B(tCsEBL);
+
+    // S2R / R2S for reading B from and writing BpEB into the swizzled sB.
+    TiledMmaNoiseB_half tiled_mma_half;
+    auto s2r_tiled_copy_B = make_tiled_copy_C(S2RCopyAtomB{}, tiled_mma_half);
+    auto s2r_thr_copy_B = s2r_tiled_copy_B.get_slice(thread_idx);
+    auto sB_u16 = recast<uint16_t>(sB_pi);
+    auto taccCsB = s2r_thr_copy_B.partition_S(sB_u16);
+    auto tCrB = partition_fragment_C(
+        tiled_mma_half,
+        cute::Shape<cute::Int<KTraits::bN>, cute::Int<KTraits::bK / 2>>{});
+    auto tCrB_u16 = make_tensor_like<uint16_t>(tCrB);
+    auto taccCrB = s2r_thr_copy_B.retile_D(tCrB_u16);
+    auto taccCrB_int8 = recast<ElementIn>(taccCrB);
+    auto r2s_tiled_copy_B = make_tiled_copy_C(R2SCopyAtomB{}, tiled_mma_half);
+    auto r2s_thr_copy_B = r2s_tiled_copy_B.get_slice(thread_idx);
+
+    // E_B = EBR * EBL
+    clear(tCrEB);
+    warpgroup_fence_operand(tCrEB);
+    warpgroup_arrive();
+    gemm(tiled_mma, tCrEBR, tCrEBL(_, _, _, stage), tCrEB);
+    warpgroup_commit_batch();
+    warpgroup_wait<0>();
+    warpgroup_fence_operand(tCrEB);
+
+    // Load current (raw) B tile from swizzled sB into registers.
+    cute::copy(s2r_tiled_copy_B, taccCsB(_, _, _, stage), taccCrB);
+    cutlass::arch::NamedBarrier::sync(
+        kNumMmaThreads,
+        static_cast<uint32_t>(pearl::NamedBarriers::S2RCopyBDone));
+    cutlass::arch::fence_view_async_shared();
+
+    // Narrow E_B int32 -> int8 (exact; noise is in-range), shuffle, add to B.
+    pearl::convert_type_out(tCrEB, tCrEB_int8);
+    permute_Aregs_fp8(tCrEB_int8);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(taccCrB_int8); ++i) {
+      taccCrB_int8[i] += tCrEB_int8[i];
+    }
+    // Write BpEB back into the swizzled sB[stage] (R2S), in place.
+    auto taccCsB_w = r2s_thr_copy_B.partition_D(sB_u16);
+    cute::copy(r2s_tiled_copy_B, taccCrB, taccCsB_w(_, _, _, stage));
+    cutlass::arch::fence_view_async_shared();
+    cutlass::arch::NamedBarrier::sync(
+        kNumMmaThreads,
+        static_cast<uint32_t>(pearl::NamedBarriers::S2RCopyBDone));
   }
 
   template <typename SharedStorage, typename FrgTensorC,
@@ -376,6 +498,12 @@ struct CollectiveMainloop {
       // Wait for TMA to load this stage of the pipeline
       pipeline.consumer_wait(smem_pipe_read);
       auto stage = smem_pipe_read.index();
+
+      if constexpr (FuseNoiseB) {
+        // Transform raw B in sB[stage] -> BpEB = B + int8(EBL*EBR), in place,
+        // before the main GEMM consumes it. Kills the HBM round-trip of BpEB.
+        fuse_noise_b_inplace(shared_storage, stage, thread_idx);
+      }
 
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < k_blocks_per_tile; ++k_block) {
