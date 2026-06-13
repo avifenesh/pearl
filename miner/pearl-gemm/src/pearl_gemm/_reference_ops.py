@@ -40,6 +40,19 @@ def _get_noisy_gemm(noise_rank: int, noise_range: int):
     return NoisyGemm(noise_rank=noise_rank, noise_range=noise_range)
 
 
+def _int_matmul_dequant(A, B, A_scales, B_scales, out_dtype):
+    """C = A_scales * (A @ B.T) * B_scales, exact int32 accumulation.
+
+    torch has no integer matmul on CUDA ("addmm_cuda not implemented for Int"),
+    so do the int32 matmul on CPU then move back to A's device for dequant.
+    """
+    dev = A.device
+    acc = (A.detach().cpu().to(torch.int32) @ B.detach().cpu().to(torch.int32).T)
+    acc = acc.to(dev).to(torch.float32)
+    acc = acc * A_scales.view(-1, 1).to(torch.float32) * B_scales.view(1, -1).to(torch.float32)
+    return acc.to(out_dtype)
+
+
 def _to_bytes32(t: torch.Tensor) -> bytes:
     """A (32,) uint8 / (8,) uint32 tensor -> 32 raw bytes."""
     return t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()[:32]
@@ -120,9 +133,7 @@ def gemm(A, B, A_scales, B_scales, C, tile_size_m=128, tile_size_n=256, tile_siz
          cluster_size_m=1, cluster_size_n=1, pipeline_stages=None, swizzle=None,
          swizzle_n_maj=True):
     """Plain quantized GEMM: C = A_scales * (A @ B.T) * B_scales (no noising)."""
-    acc = (A.to(torch.int32) @ B.to(torch.int32).T).to(torch.float32)
-    acc = acc * A_scales.view(-1, 1).to(torch.float32) * B_scales.view(1, -1).to(torch.float32)
-    C.copy_(acc.to(C.dtype))
+    C.copy_(_int_matmul_dequant(A, B, A_scales, B_scales, C.dtype))
     return None
 
 
@@ -166,9 +177,7 @@ def noisy_gemm(A, B, EAL, EAL_fp16, EBR, EBR_fp16, EAR_R_major, EBL_R_major,
 
     fast_dev = _os.getenv("PEARL_GEMM_FAST_DEV", "").lower() in ("1", "true", "yes")
     if fast_dev or skip_reduction:
-        acc = (A.to(torch.int32) @ B.to(torch.int32).T).to(torch.float32)
-        acc = acc * A_scales.view(-1, 1).to(torch.float32) * B_scales.view(1, -1).to(torch.float32)
-        C.copy_(acc.to(C.dtype))
+        C.copy_(_int_matmul_dequant(A, B, A_scales, B_scales, C.dtype))
         ref._set_header(host_signal_header_pinned,
                         ref.HostSignalHeader(status=ref.HostSignalStatus.kSignalIdle))
         return None
@@ -176,17 +185,17 @@ def noisy_gemm(A, B, EAL, EAL_fp16, EBR, EBR_fp16, EAR_R_major, EBL_R_major,
     pt = _pow_target_to_int(pow_target)
     R = EAL.shape[1]
     ng = _get_noisy_gemm(R, ref_noise_range())
-    dev = A.device
-    Aii = A.to(dev)
-    Bii = B.to(dev)
+    # NoisyGemm uses integer matmul, which torch only supports on CPU. Run the
+    # reference on CPU then move the result back to the caller's device.
+    out_dev = C.device
     ch = CommitmentHash(noise_seed_A=kA, noise_seed_B=kB)
     C_out, found = ng.noisy_gemm(
-        Aii, Bii,
-        E_AL.to(dev), E_AR.to(dev), E_BL.to(dev), E_BR.to(dev),
+        A.detach().cpu(), B.detach().cpu(),
+        E_AL.cpu(), E_AR.cpu(), E_BL.cpu(), E_BR.cpu(),
         ch, pow_target=pt,
     )
     # Dequantize to C's dtype (C_out is int32 raw matmul of the de-noised path).
-    deq = C_out.to(torch.float32)
+    deq = C_out.to(out_dev).to(torch.float32)
     deq = deq * A_scales.view(-1, 1).to(torch.float32) * B_scales.view(1, -1).to(torch.float32)
     C.copy_(deq.to(C.dtype))
 
