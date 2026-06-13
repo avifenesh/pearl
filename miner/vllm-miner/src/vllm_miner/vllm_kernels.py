@@ -203,13 +203,14 @@ class PearlKernel(Int8ScaledMMLinearKernel):
 
         # Use noisy GEMM for large matrices (mining), vanilla for small ones
         if config.should_use_noisy_gemm(m, n, k) and not config.settings.no_mining:
-            # Route through the registered custom op so the mining GEMM appears
-            # as a single node in the FX graph and can be declared a piecewise
-            # CUDA-graph splitting op (see vllm_miner.piecewise). The op runs
-            # eager; all host-side mining work stays inside its body.
-            from .noisy_gemm_op import noisy_gemm_mining
+            # Route through the registered void custom op (writes into a
+            # preallocated C) so the mining GEMM appears as a single node in the
+            # FX graph and can be declared a piecewise CUDA-graph splitting op
+            # (see vllm_miner.piecewise). The op runs eager; all host-side mining
+            # work stays inside its body.
+            from .noisy_gemm_op import noisy_gemm_mining_out
 
-            return noisy_gemm_mining(
+            return noisy_gemm_mining_out(
                 x_q.contiguous(),
                 w_q.contiguous(),
                 x_s.squeeze(-1),

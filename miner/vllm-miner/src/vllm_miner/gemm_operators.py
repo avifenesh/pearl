@@ -75,6 +75,7 @@ def pearl_gemm_noisy(
     out_dtype: torch.dtype,
     layer: torch.nn.Module | None = None,
     submit_block: bool = True,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Performs quantized matrix multiplication with cryptographic noise for blockchain mining.
@@ -101,7 +102,9 @@ def pearl_gemm_noisy(
     B = b
     A_scales = scale_a
     B_scales = scale_b
-    C = torch.empty((m, n), dtype=out_dtype, device=a.device)
+    # When ``out`` is provided (e.g. by the void custom op for graph capture),
+    # write into it instead of allocating a fresh output tensor.
+    C = out if out is not None else torch.empty((m, n), dtype=out_dtype, device=a.device)
 
     matrix_bytes = max(m * k, n * k)
     tensor_hash_scratchpad = torch.empty(
