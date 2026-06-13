@@ -87,6 +87,11 @@ struct CollectiveMainloop {
     uint64_t* inner_hash_counter;
     uint32_t const* ptr_pow_target;
     uint32_t const* ptr_pow_key;
+    // B-side fusion (B'): raw (un-noised) weights + skinny noise factors. When
+    // kFuseNoiseB, ptr_B points at raw B and BpEB is formed on-chip from these.
+    // Null/ignored in the stock (kFuseNoiseB==false) path.
+    ElementIn const* ptr_EBL_R_major = nullptr;  // (k, R)
+    ElementIn const* ptr_EBR = nullptr;          // (R, n)
   };
 
   struct Params {
@@ -102,6 +107,8 @@ struct CollectiveMainloop {
     uint64_t* inner_hash_counter;
     uint32_t const* ptr_pow_target;
     uint32_t const* ptr_pow_key;
+    ElementIn const* ptr_EBL_R_major = nullptr;  // (k, R), only when kFuseNoiseB
+    ElementIn const* ptr_EBR = nullptr;          // (R, n), only when kFuseNoiseB
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -133,7 +140,9 @@ struct CollectiveMainloop {
             .problem_shape = args.problem_shape,
             .inner_hash_counter = args.inner_hash_counter,
             .ptr_pow_target = args.ptr_pow_target,
-            .ptr_pow_key = args.ptr_pow_key};
+            .ptr_pow_key = args.ptr_pow_key,
+            .ptr_EBL_R_major = args.ptr_EBL_R_major,
+            .ptr_EBR = args.ptr_EBR};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -207,6 +216,37 @@ struct CollectiveMainloop {
              tAgA(_, k_tile), tAsA(_, stage));
         copy(mainloop_params.tma_load_B.with(*tmaBar, tma_mcast_mask_b),
              tBgB(_, k_tile), tBsB(_, stage));
+        if constexpr (KTraits::FuseNoiseB) {
+          // ===================================================================
+          // B' fusion (H100 work-in-progress; default build sets FuseNoiseB=false
+          // so this branch is never instantiated and the stock path is unchanged).
+          //
+          // Here tBgB points at the RAW weights B (see pearl_gemm_host.h). We must
+          // turn the just-loaded raw-B tile in sB(stage) into the noised
+          //     BpEB = B + E_B,   E_B = int8( EBL(bK,R) * EBR(R,bN) )
+          // IN PLACE, in the swizzled SmemLayoutB the WGMMA consumer reads.
+          //
+          // Plan (compute once per n-block, hold E_B factors in SMEM):
+          //   1. Stage EBL (k,R) and EBR (R,n) tiles for this (n_block,k_tile) into
+          //      SMEM scratch (added to SharedStorage; EBR per n-block reused over m,
+          //      EBL per k-tile). Pointers: mainloop_params.ptr_EBL_R_major / ptr_EBR.
+          //   2. A dedicated noise warpgroup computes E_B = EBL*EBR via int8*int8->int32
+          //      WGMMA, truncates to int8 (wrap, matching miner_base.noise_B), and
+          //      adds into sB(stage) through the same swizzle write path noisingB uses
+          //      to build BpEB (R2SCopyAtom + the half-MMA layout-recover trick), but
+          //      writing the SWIZZLED SmemLayoutB rather than the store layout.
+          //   3. EARxBpEB (denoise side-product, R x n) is then formed from the on-chip
+          //      BpEB tiles (EAR*BpEB accumulated over k) into the SMEM the epilogue
+          //      already reads via the DenoiseComplete barrier — replacing noisingB's
+          //      SMEM->HBM->SMEM with SMEM->SMEM.
+          // Validated bit-exact at the math level in validate_fused_B.py.
+          // The TMA-load+commit ordering above must be reworked so the noise WG runs
+          // between load-complete and consumer-consume (extra pipeline phase).
+          // ===================================================================
+          static_assert(KTraits::FuseNoiseB && false,
+                        "B' fusion compute block not yet implemented; build "
+                        "without PEARL_FUSE_NOISE_B (the default).");
+        }
         pipeline.producer_commit(smem_pipe_write, TmaTransactionBytes);
         ++smem_pipe_write;
       }

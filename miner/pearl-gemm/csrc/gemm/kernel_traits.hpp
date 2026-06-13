@@ -9,6 +9,7 @@
 #include "cutlass/layout/layout.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/pipeline/pipeline.hpp"
+#include "pearl_gemm_constants.hpp"
 
 namespace pearl {
 using namespace cute;
@@ -33,6 +34,8 @@ struct KernelTraits {
   static constexpr bool Is_Even_N = Is_Even_N_;
   static constexpr bool SkipReduction = SkipReduction_;
   static constexpr bool SkipDenoising = SkipDenoising_;
+  // B-side noise fusion (B'): compile-time, default false (see pearl_gemm_constants.hpp).
+  static constexpr bool FuseNoiseB = pearl::kFuseNoiseB;
   static constexpr int kStages = kStages_;
   static constexpr bool EnableDebug = EnableDebug_;
   static constexpr int srcLane = 0;

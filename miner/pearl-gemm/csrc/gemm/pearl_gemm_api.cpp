@@ -891,8 +891,13 @@ void noisy_gemm(
                     tile_size_n_noising_B, tile_size_k_noising_B, r,
                     pipeline_stages_noising_B, EARxBpEB_noising_dtype,
                     kernel_found_noising_b = true;
-                    run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_,
-                                         stages_>(params, stream););
+                    // B' fusion: the main GEMM forms BpEB on-chip, so the
+                    // separate noising_B kernel (which materializes BpEB to HBM)
+                    // is skipped. EARxBpEB is produced inside the fused GEMM.
+                    if (!pearl::kFuseNoiseB) {
+                      run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_,
+                                           stages_>(params, stream);
+                    });
               } else { kernel_found_noising_b = true; }
 
               if (do_denoise_conversion) {
