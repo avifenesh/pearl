@@ -12,6 +12,8 @@ NOT performance-representative. For local correctness / PoW bit-exactness only.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from . import _reference_cuda as ref
@@ -20,6 +22,22 @@ from . import _reference_cuda as ref
 # populated by noise_gen, consumed by noisy_gemm so the same reference noise is
 # used end to end.
 _NOISE_TABLE: dict[int, tuple] = {}
+
+
+@functools.lru_cache(maxsize=8)
+def _get_noise_generator(noise_rank: int, noise_range: int):
+    """Cache NoiseGenerator instances (instantiation logs + setup are non-trivial)."""
+    from miner_base.noise_generation import NoiseGenerator
+
+    return NoiseGenerator(noise_rank=noise_rank, noise_range=noise_range)
+
+
+@functools.lru_cache(maxsize=8)
+def _get_noisy_gemm(noise_rank: int, noise_range: int):
+    """Cache NoisyGemm instances — avoids re-instantiating on every call."""
+    from miner_base.noisy_gemm import NoisyGemm
+
+    return NoisyGemm(noise_rank=noise_rank, noise_range=noise_range)
 
 
 def _to_bytes32(t: torch.Tensor) -> bytes:
@@ -65,8 +83,6 @@ def noise_gen(
     record the full (E_AL,E_AR,E_BL,E_BR,key_A,key_B) keyed by id(EAL) so
     noisy_gemm can run the faithful NoisyGemm with the matching factors.
     """
-    from miner_base.noise_generation import NoiseGenerator
-
     if aux_buffer is not None:
         aux_buffer.zero_()
     if EAL is None or key_A is None or key_B is None:
@@ -79,7 +95,7 @@ def noise_gen(
     kA = _to_bytes32(key_A)
     kB = _to_bytes32(key_B)
 
-    gen = NoiseGenerator(noise_rank=R, noise_range=ref_noise_range())
+    gen = _get_noise_generator(R, ref_noise_range())
     E_AL, E_AR, E_BL, E_BR = gen.generate_noise_metrices(kA, kB, m, k, n)
 
     # The kernel-layout output tensors (EAL/EBR/*_R_major/*_K_major + fp16 twins)
@@ -128,7 +144,6 @@ def noisy_gemm(A, B, EAL, EAL_fp16, EBR, EBR_fp16, EAR_R_major, EBL_R_major,
     HostSignalHeader keyed to ``host_signal_header_pinned`` (read back by
     get_host_signal_header).
     """
-    from miner_base.noisy_gemm import NoisyGemm
     from pearl_gateway.comm.dataclasses import CommitmentHash
 
     stash = _NOISE_TABLE.pop(id(EAL), None)
@@ -142,9 +157,25 @@ def noisy_gemm(A, B, EAL, EAL_fp16, EBR, EBR_fp16, EAR_R_major, EBL_R_major,
         )
     E_AL, E_AR, E_BL, E_BR, kA, kB = stash
 
+    # Fast-dev mode: skip the expensive per-tile PoW hash sweep (32k blake3
+    # hashes) and just produce the (noise-free) dequantized matmul output. The
+    # noisy GEMM denoises back to A@B.T, so C is the same as a plain GEMM here;
+    # this is for fast logic/integration iteration where PoW detection is not
+    # needed. No block is ever "found" in this mode.
+    import os as _os
+
+    fast_dev = _os.getenv("PEARL_GEMM_FAST_DEV", "").lower() in ("1", "true", "yes")
+    if fast_dev or skip_reduction:
+        acc = (A.to(torch.int32) @ B.to(torch.int32).T).to(torch.float32)
+        acc = acc * A_scales.view(-1, 1).to(torch.float32) * B_scales.view(1, -1).to(torch.float32)
+        C.copy_(acc.to(C.dtype))
+        ref._set_header(host_signal_header_pinned,
+                        ref.HostSignalHeader(status=ref.HostSignalStatus.kSignalIdle))
+        return None
+
     pt = _pow_target_to_int(pow_target)
     R = EAL.shape[1]
-    ng = NoisyGemm(noise_rank=R, noise_range=ref_noise_range())
+    ng = _get_noisy_gemm(R, ref_noise_range())
     dev = A.device
     Aii = A.to(dev)
     Bii = B.to(dev)
