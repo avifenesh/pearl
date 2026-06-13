@@ -129,5 +129,38 @@ docker run --rm -it --gpus all \
   --enforce-eager
 ```
 
+### CUDA graphs (piecewise) — optional, recommended over `--enforce-eager`
+
+The mining GEMM does per-forward-pass host work (reads the current mining job,
+schedules CUDA-event callbacks, allocates scratch), which cannot be replayed
+inside a CUDA graph. Historically the miner therefore ran fully eager
+(`--enforce-eager`). vLLM's v1 engine instead supports **piecewise** CUDA
+graphs: the model graph is split at declared "splitting ops", the subgraphs
+between splits are captured/replayed, and the splitting ops run eager. The miner
+registers its mining GEMM as the custom op `vllm_miner::noisy_gemm_mining`, so
+declaring it a splitting op keeps mining eager while capturing the rest of the
+model (norms, rotary, attention, small GEMMs, sampler).
+
+Replace `--enforce-eager` with a piecewise compilation config:
+
+```bash
+  ... \
+  --compilation-config '{"cudagraph_mode": "PIECEWISE", "splitting_ops": ["vllm::unified_attention_with_output", "vllm::unified_mla_attention_with_output", "vllm::mamba_mixer2", "vllm::mamba_mixer", "vllm::short_conv", "vllm::linear_attention", "vllm::plamo2_mamba_mixer", "vllm::gdn_attention_core", "vllm::gdn_attention_core_xpu", "vllm::olmo_hybrid_gdn_full_forward", "vllm::kda_attention", "vllm::sparse_attn_indexer", "vllm::rocm_aiter_sparse_attn_indexer", "vllm::deepseek_v4_attention", "vllm_miner::noisy_gemm_mining"]}'
+```
+
+The `splitting_ops` list **must** include vLLM's default attention ops plus
+`vllm_miner::noisy_gemm_mining`; if you pass `splitting_ops`, vLLM does not
+re-add its defaults. The exact default list can be generated with
+`vllm_miner.piecewise.pearl_splitting_ops()`. Mining semantics are unchanged:
+the mining op still runs eager between captured subgraphs.
+
+`--enforce-eager` remains a valid fallback (no CUDA graphs at all) if you hit a
+capture issue.
+
+> **Status:** the piecewise recipe is validated at the op/compiler-plumbing
+> level (the mining op is a single FX-graph node and is preserved in
+> `splitting_ops`). End-to-end throughput numbers on H100 are pending.
+
+
 
 

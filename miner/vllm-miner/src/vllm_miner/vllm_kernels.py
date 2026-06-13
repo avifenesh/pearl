@@ -23,7 +23,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.platforms import current_platform
 
 from .config import config
-from .gemm_operators import pearl_gemm_noisy, pearl_gemm_vanilla
+from .gemm_operators import pearl_gemm_vanilla
 from .mining_state import get_async_manager
 from .quantization_operators import (
     quant_7bit,
@@ -203,14 +203,19 @@ class PearlKernel(Int8ScaledMMLinearKernel):
 
         # Use noisy GEMM for large matrices (mining), vanilla for small ones
         if config.should_use_noisy_gemm(m, n, k) and not config.settings.no_mining:
-            return pearl_gemm_noisy(
+            # Route through the registered custom op so the mining GEMM appears
+            # as a single node in the FX graph and can be declared a piecewise
+            # CUDA-graph splitting op (see vllm_miner.piecewise). The op runs
+            # eager; all host-side mining work stays inside its body.
+            from .noisy_gemm_op import noisy_gemm_mining
+
+            return noisy_gemm_mining(
                 x_q.contiguous(),
                 w_q.contiguous(),
-                scale_a=x_s.squeeze(-1),
-                scale_b=w_s.squeeze(-1),
-                out_dtype=x.dtype,
-                layer=layer,
-                submit_block=not get_async_manager()._conf.skip_block_submission,
+                x_s.squeeze(-1),
+                w_s.squeeze(-1),
+                x.dtype,
+                not get_async_manager()._conf.skip_block_submission,
             )
         else:
             return pearl_gemm_vanilla(
