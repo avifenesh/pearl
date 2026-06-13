@@ -13,9 +13,16 @@ from pearl_gemm_build_utils.kernel_configs import (
 )
 
 # Build matmul kernels
+import os as _os
+
 _matmul_kernels = []
 
-# 128x256x128, R=64/128, stage=3
+# B' fusion stages the int8 EBL ring in SMEM alongside A/B; drop the main GEMM
+# to 2 pipeline stages so the fused build fits the H100 SMEM limit.
+_matmul_stages = 2 if _os.environ.get("PEARL_FUSE_NOISE_B", "").upper() in (
+    "1", "TRUE", "YES", "ON") else 3
+
+# 128x256x128, R=64/128
 for R in [64, 128]:
     _matmul_kernels.append(
         MatmulKernelConfig(
@@ -23,7 +30,7 @@ for R in [64, 128]:
             tile_size_n=256,
             tile_size_k=128,
             R=R,
-            pipeline_stages=3,
+            pipeline_stages=_matmul_stages,
             cM=1,
             cN=1,
         )

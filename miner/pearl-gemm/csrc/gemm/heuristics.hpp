@@ -26,12 +26,17 @@ static inline int get_swizzle_size(int K, int tile_size_n,
 static inline int get_pipeline_stages(int tile_size_m, int tile_size_n,
                                       int tile_size_k, int R,
                                       bool skip_denoising,
-                                      cudaDeviceProp const* const dprops) {
+                                      cudaDeviceProp const* const dprops,
+                                      bool fuse_noise_b = false) {
   int const smem_size = dprops->sharedMemPerBlockOptin;
   // A, B (int8) and their pipeline (2 int64 mbarriers per stage)
-  int const AB_one_stage_size = (tile_size_m * tile_size_k) +
-                                (tile_size_n * tile_size_k) +
-                                (2 * sizeof(int64_t));
+  int AB_one_stage_size = (tile_size_m * tile_size_k) +
+                          (tile_size_n * tile_size_k) +
+                          (2 * sizeof(int64_t));
+  // B' fusion: EBL (bK x R int8) is staged per pipeline stage alongside B.
+  if (fuse_noise_b) {
+    AB_one_stage_size += tile_size_k * R;
+  }
   // C (bf16)
   int const C_size = tile_size_m * tile_size_n * sizeof(cutlass::bfloat16_t);
   // AxEBL, EBR overlap with C for load.
@@ -42,7 +47,9 @@ static inline int get_pipeline_stages(int tile_size_m, int tile_size_n,
   int const C_union_size = std::max(C_size, AxEB_size);
   // A_scales, B_scales (fp32)
   int const scale_size = (tile_size_m + tile_size_n) * sizeof(float);
-  int const rest_size = 128;
+  // B' fusion: EBR (bN x R int8), single buffer (constant over k).
+  int const fuse_b_fixed = fuse_noise_b ? (tile_size_n * R) : 0;
+  int const rest_size = 128 + fuse_b_fixed;
 
   int const pipeline_stages =
       (smem_size - (C_union_size + scale_size + rest_size)) / AB_one_stage_size;
