@@ -446,7 +446,8 @@ struct CollectiveMainloop {
     for (int i = 0; i < size(taccCrB_int8); ++i) {
       taccCrB_int8[i] += tCrEB_int8[i];
     }
-    // Write BpEB back into the swizzled sB[stage] (R2S), in place.
+    // Write BpEB back into the swizzled sB[stage] (R2S), in place. One barrier
+    // ensures the write is complete + visible before the main GEMM reads sB.
     auto taccCsB_w = r2s_thr_copy_B.partition_D(sB_u16);
     cute::copy(r2s_tiled_copy_B, taccCrB, taccCsB_w(_, _, _, stage));
     cutlass::arch::fence_view_async_shared();
