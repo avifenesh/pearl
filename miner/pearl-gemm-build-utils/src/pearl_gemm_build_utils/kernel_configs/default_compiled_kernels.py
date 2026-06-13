@@ -17,10 +17,32 @@ import os as _os
 
 _matmul_kernels = []
 
+
+def _fuse_noise_b_enabled() -> bool:
+    """Whether the fused B' build is active.
+
+    Read a build-written marker FIRST (so the test/runtime config always matches
+    what was actually compiled, regardless of the current env), then fall back to
+    the env var (build time), then default off. This avoids the trap where the
+    GEMM was built fused (2 stages) but a later process reads the env unset and
+    requests an un-compiled 3-stage kernel (or vice versa)."""
+    try:
+        from pearl_gemm_build_utils.kernel_configs import _build_marker
+
+        return bool(_build_marker.FUSE_NOISE_B)
+    except Exception:
+        pass
+    return _os.environ.get("PEARL_FUSE_NOISE_B", "").upper() in (
+        "1",
+        "TRUE",
+        "YES",
+        "ON",
+    )
+
+
 # B' fusion stages the int8 EBL ring in SMEM alongside A/B; drop the main GEMM
 # to 2 pipeline stages so the fused build fits the H100 SMEM limit.
-_matmul_stages = 2 if _os.environ.get("PEARL_FUSE_NOISE_B", "").upper() in (
-    "1", "TRUE", "YES", "ON") else 3
+_matmul_stages = 2 if _fuse_noise_b_enabled() else 3
 
 # 128x256x128, R=64/128
 for R in [64, 128]:
