@@ -93,7 +93,7 @@ struct CollectiveMainloop {
   using TiledMmaNoiseB = decltype(cute::make_tiled_mma(
       cute::GMMA::ss_op_selector<ElementIn, ElementIn, ElementAccum,
                                  TileShape_NKR>(),
-      typename KTraits::AtomLayoutMNK{}));
+      cute::Layout<cute::Shape<cute::_1, cute::_1, cute::_1>>{}));  // single WG
   // EBR: (bN, R) R-major, no pipeline (constant over k). EBL: (bK, R) R-major.
   using SmemLayoutAtomEBR =
       decltype(cutlass::gemm::collective::detail::ss_smem_selector<
@@ -116,7 +116,7 @@ struct CollectiveMainloop {
   using TiledMmaNoiseB_half = decltype(cute::make_tiled_mma(
       cute::GMMA::ss_op_selector<ElementIn, ElementIn, ElementAccum,
                                  TileShape_NKR_half>(),
-      typename KTraits::AtomLayoutMNK{}));
+      cute::Layout<cute::Shape<cute::_1, cute::_1, cute::_1>>{}));  // single WG
   using S2RCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, uint16_t>;
   using R2SCopyAtomB = Copy_Atom<SM90_U32x4_STSM_N, uint16_t>;
 
@@ -435,7 +435,7 @@ struct CollectiveMainloop {
     // Load current (raw) B tile from swizzled sB into registers.
     cute::copy(s2r_tiled_copy_B, taccCsB(_, _, _, stage), taccCrB);
     cutlass::arch::NamedBarrier::sync(
-        kNumMmaThreads,
+        cutlass::NumThreadsPerWarpGroup,
         static_cast<uint32_t>(pearl::NamedBarriers::S2RCopyBDone));
     cutlass::arch::fence_view_async_shared();
 
@@ -452,7 +452,7 @@ struct CollectiveMainloop {
     cute::copy(r2s_tiled_copy_B, taccCrB, taccCsB_w(_, _, _, stage));
     cutlass::arch::fence_view_async_shared();
     cutlass::arch::NamedBarrier::sync(
-        kNumMmaThreads,
+        cutlass::NumThreadsPerWarpGroup,
         static_cast<uint32_t>(pearl::NamedBarriers::S2RCopyBDone));
   }
 
@@ -507,11 +507,17 @@ struct CollectiveMainloop {
 
       if constexpr (FuseNoiseB) {
         // Transform raw B in sB[stage] -> BpEB = B + int8(EBL*EBR), in place,
-        // before the main GEMM consumes it. Only when noise factors are actually
-        // present (mining on); otherwise sB already holds the operand to use.
+        // before the main GEMM consumes it. Only when noise factors are present.
+        // Runs on a SINGLE consumer warpgroup (threads 0..127) matching the
+        // noising_B reference; all MMA warpgroups then sync before reading sB.
         if (mainloop_params.ptr_EBR != nullptr &&
             mainloop_params.ptr_EBL_R_major != nullptr) {
-          fuse_noise_b_inplace(shared_storage, stage, thread_idx);
+          if (thread_idx < cutlass::NumThreadsPerWarpGroup) {
+            fuse_noise_b_inplace(shared_storage, stage, thread_idx);
+          }
+          cutlass::arch::NamedBarrier::sync(
+              kNumMmaThreads,
+              static_cast<uint32_t>(pearl::NamedBarriers::FuseNoiseBReady));
         }
       }
 

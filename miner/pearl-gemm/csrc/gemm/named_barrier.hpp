@@ -19,6 +19,7 @@ enum class NamedBarriers {
   DenoiseConvertEAxBpEBWrite = 8,
   Epilogue = 9,
   LoadScales = 10,
-  S2RCopyBDone = 11,  // B' fusion: sB read/write sync in fuse_noise_b_inplace
+  S2RCopyBDone = 11,  // B' fusion: sB read/write sync (single WG, 128 thr)
+  FuseNoiseBReady = 12,  // B' fusion: all MMA WGs wait for noised sB
 };
 }
