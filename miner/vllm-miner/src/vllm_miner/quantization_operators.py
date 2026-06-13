@@ -1,5 +1,10 @@
+# Importing the package registers the `pearl_gemm::*` torch custom ops (and their
+# fakes) used below. We call the ops via ``torch.ops.pearl_gemm.*`` rather than the
+# raw pybind functions so the quantization step is traceable by torch.compile /
+# Dynamo (required for piecewise CUDA-graph capture; a raw pybind call is "marked
+# as skipped" and breaks full-graph capture of the model).
+import pearl_gemm  # noqa: F401  (registers torch.ops.pearl_gemm.*)
 import torch
-from pearl_gemm import quantize
 
 from .mining_state import get_async_manager
 
@@ -25,7 +30,8 @@ def quantize_kernel(x: torch.Tensor, max_val: int = 63, smooth_scale: torch.Tens
     num_tokens, _ = x.shape
     x_q = torch.empty_like(x, dtype=torch.int8)
     x_s = torch.empty((num_tokens, 1), dtype=torch.float32, device=x.device)
-    quantize(x, x_q, x_s, fast_math=fast_math, max_val=max_val, smooth_scale=smooth_scale)
+    # Use the registered custom op (traceable) instead of the raw pybind call.
+    torch.ops.pearl_gemm.quantize(x, x_q, x_s, max_val, smooth_scale, fast_math)
     return x_q, x_s, None
 
 

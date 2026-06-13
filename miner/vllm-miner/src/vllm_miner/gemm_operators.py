@@ -4,7 +4,6 @@ from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
 from miner_utils import get_logger
 from pearl_gemm import (
     commitment_hash_from_merkle_roots,
-    gemm,
     get_host_signal_sync_size,
     get_required_scratchpad_bytes,
     make_pow_target_tensor,
@@ -51,15 +50,18 @@ def pearl_gemm_vanilla(
 
     C = torch.empty((A.shape[0], B.shape[0]), dtype=out_dtype, device=A.device)
 
-    gemm(
-        A=A,
-        B=B,
-        A_scales=A_scales,
-        B_scales=B_scales,
-        C=C,
-        tile_size_m=config.settings.tile_size_m,
-        tile_size_n=config.settings.tile_size_n,
-        tile_size_k=config.settings.tile_size_k,
+    # Use the registered custom op (traceable by torch.compile) instead of the
+    # raw pybind `gemm`, so the vanilla GEMM does not break piecewise CUDA-graph
+    # capture when it runs inside a captured region of the model graph.
+    torch.ops.pearl_gemm.gemm(
+        A,
+        B,
+        A_scales,
+        B_scales,
+        C,
+        config.settings.tile_size_m,
+        config.settings.tile_size_n,
+        config.settings.tile_size_k,
     )
 
     return C
