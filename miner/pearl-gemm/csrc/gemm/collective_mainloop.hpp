@@ -78,6 +78,47 @@ struct CollectiveMainloop {
   static constexpr uint32_t TmaTransactionBytes =
       TmaTransactionBytesA + TmaTransactionBytesB;
 
+  // ===========================================================================
+  // B' fusion types (only used when KTraits::FuseNoiseB). Mirror the noising_B
+  // kernel so the on-chip BpEB = B + int8(EBL*EBR) is formed with the SAME WGMMA
+  // path, but the result is written back into the swizzled SmemLayoutB (the GEMM
+  // operand layout) instead of a store-layout buffer destined for HBM.
+  // ===========================================================================
+  static constexpr int R = KTraits::R;
+  using ElementAccum = typename KTraits::ElementAccum;  // int32
+  // B + EBR*EBL accumulator tile: (bN, bK, R) as in noising_B (TiledMmaNKR).
+  using TileShape_NKR =
+      cute::Shape<cute::Int<KTraits::bN>, cute::Int<KTraits::bK>, cute::Int<R>>;
+  using TiledMmaNoiseB = decltype(cute::make_tiled_mma(
+      cute::GMMA::ss_op_selector<ElementIn, ElementIn, ElementAccum,
+                                 TileShape_NKR>(),
+      typename KTraits::AtomLayoutMNK{}));
+  // EBR: (bN, R) R-major, no pipeline (constant over k). EBL: (bK, R) R-major.
+  using SmemLayoutAtomEBR =
+      decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+               GMMA::Major::K, ElementIn, cute::Int<KTraits::bN>,
+               cute::Int<R>>());
+  using SmemLayoutEBR = decltype(tile_to_shape(
+      SmemLayoutAtomEBR{}, cute::Shape<cute::Int<KTraits::bN>, cute::Int<R>>{}));
+  using SmemLayoutAtomEBL =
+      decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+               GMMA::Major::K, ElementIn, cute::Int<KTraits::bK>,
+               cute::Int<R>>());
+  using SmemLayoutEBL = decltype(tile_to_shape(
+      SmemLayoutAtomEBL{},
+      cute::Shape<cute::Int<KTraits::bK>, cute::Int<R>, cute::Int<kStages>>{}));
+  // Half TiledMma + S2R/R2S atoms to read B from / write BpEB into swizzled sB,
+  // matching noising_B's compute_BpEB (16-bit STSM/LDSM over int8 pairs).
+  using TileShape_NKR_half =
+      cute::Shape<cute::Int<KTraits::bN>, cute::Int<KTraits::bK / 2>,
+                  cute::Int<R>>;
+  using TiledMmaNoiseB_half = decltype(cute::make_tiled_mma(
+      cute::GMMA::ss_op_selector<ElementIn, ElementIn, ElementAccum,
+                                 TileShape_NKR_half>(),
+      typename KTraits::AtomLayoutMNK{}));
+  using S2RCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, uint16_t>;
+  using R2SCopyAtomB = Copy_Atom<SM90_U32x4_STSM_N, uint16_t>;
+
   struct Arguments {
     ElementIn const* ptr_A;
     ElementIn const* ptr_B;
