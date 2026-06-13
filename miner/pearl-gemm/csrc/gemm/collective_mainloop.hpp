@@ -191,23 +191,28 @@ struct CollectiveMainloop {
         make_tma_copy(TMAOpB{}, mB, SmemLayoutB{}(_, _, _0{}),
                       select<1, 2>(TileShape_MNK{}), kClusterSizeM);
 
-    // B' fusion noise-factor TMA loaders. Built unconditionally (cheap, types
-    // must exist); only used when FuseNoiseB and the pointers are non-null.
+    // B' fusion noise-factor TMA loaders. Only construct real descriptors when
+    // fusing (else TMA init validates bogus EBL/EBR layouts over ptr_B and fails).
     LayoutT layout_EBL =
         make_layout(make_shape(K, (int32_t)R), make_stride((int32_t)R, _1{}));
     LayoutT layout_EBR =
         make_layout(make_shape(N, (int32_t)R), make_stride((int32_t)R, _1{}));
-    ElementIn const* ebl_ptr =
-        args.ptr_EBL_R_major ? args.ptr_EBL_R_major : args.ptr_B;
-    ElementIn const* ebr_ptr = args.ptr_EBR ? args.ptr_EBR : args.ptr_B;
-    Tensor mEBL = make_tensor(make_gmem_ptr(ebl_ptr), layout_EBL);
-    TMA_EBL tma_load_EBL = make_tma_copy(
-        cute::SM90_TMA_LOAD{}, mEBL, take<0, 2>(SmemLayoutEBL{}),
-        cute::Shape<cute::Int<KTraits::bK>, cute::Int<R>>{}, _1{});
-    Tensor mEBR = make_tensor(make_gmem_ptr(ebr_ptr), layout_EBR);
-    TMA_EBR tma_load_EBR =
-        make_tma_copy(cute::SM90_TMA_LOAD{}, mEBR, SmemLayoutEBR{},
-                      cute::Shape<cute::Int<KTraits::bN>, cute::Int<R>>{}, _1{});
+    TMA_EBL tma_load_EBL{};
+    TMA_EBR tma_load_EBR{};
+    if constexpr (FuseNoiseB) {
+      // Only when the noise factors are actually present at runtime (mining on).
+      if (args.ptr_EBL_R_major != nullptr && args.ptr_EBR != nullptr) {
+        Tensor mEBL =
+            make_tensor(make_gmem_ptr(args.ptr_EBL_R_major), layout_EBL);
+        tma_load_EBL = make_tma_copy(
+            cute::SM90_TMA_LOAD{}, mEBL, take<0, 2>(SmemLayoutEBL{}),
+            cute::Shape<cute::Int<KTraits::bK>, cute::Int<KTraits::R>>{}, _1{});
+        Tensor mEBR = make_tensor(make_gmem_ptr(args.ptr_EBR), layout_EBR);
+        tma_load_EBR = make_tma_copy(
+            cute::SM90_TMA_LOAD{}, mEBR, SmemLayoutEBR{},
+            cute::Shape<cute::Int<KTraits::bN>, cute::Int<KTraits::R>>{}, _1{});
+      }
+    }
 
     return {.ptr_A = args.ptr_A,
             .ptr_B = args.ptr_B,
