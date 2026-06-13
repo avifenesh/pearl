@@ -506,8 +506,12 @@ struct CollectiveMainloop {
 
       if constexpr (FuseNoiseB) {
         // Transform raw B in sB[stage] -> BpEB = B + int8(EBL*EBR), in place,
-        // before the main GEMM consumes it. Kills the HBM round-trip of BpEB.
-        fuse_noise_b_inplace(shared_storage, stage, thread_idx);
+        // before the main GEMM consumes it. Only when noise factors are actually
+        // present (mining on); otherwise sB already holds the operand to use.
+        if (mainloop_params.ptr_EBR != nullptr &&
+            mainloop_params.ptr_EBL_R_major != nullptr) {
+          fuse_noise_b_inplace(shared_storage, stage, thread_idx);
+        }
       }
 
       CUTLASS_PRAGMA_UNROLL
