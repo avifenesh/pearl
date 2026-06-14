@@ -19,6 +19,7 @@ from pearl_gemm.moe import build_routing_data, get_build_routing_data_scratchpad
 from .config import config
 from .gemm_operators import generate_noise_factors
 from .mining_state import get_async_manager
+from .weight_hash_cache import cached_weight_hash
 
 _LOGGER = get_logger("vllm.pearl_miner")
 
@@ -148,7 +149,13 @@ def prepare_moe_noising(
     key_tensor = _to_gpu_u8(hash_key, device)
 
     A_hash = _hash_2d(A_q.contiguous().view(torch.uint8), key_tensor, device)
-    B_hash = _hash_2d(B_stacked.contiguous().view(torch.uint8), key_tensor, device)
+    # B_stacked is the static stacked expert weights; cache its keyed root across
+    # forward passes within a mining job (bit-identical to a fresh recompute).
+    B_hash = cached_weight_hash(
+        B_stacked,
+        hash_key,
+        lambda: _hash_2d(B_stacked.contiguous().view(torch.uint8), key_tensor, device),
+    )
 
     num_routed_slots = num_tokens * top_k
     routing_data = torch.empty(num_routed_slots, dtype=torch.int32, device=device)

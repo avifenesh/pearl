@@ -21,6 +21,7 @@ from .mining_state import (
     get_async_manager,
     get_pinned_pool,
 )
+from .weight_hash_cache import cached_weight_hash
 
 _LOGGER = get_logger("vllm.pearl_miner")
 
@@ -129,13 +130,14 @@ def pearl_gemm_noisy(
         tensor_hash_scratchpad,
     )
 
-    B_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
-    tensor_hash(
-        B,
-        key_tensor,
-        B_tensor_hash,
-        tensor_hash_scratchpad,
-    )
+    # B is the layer weight (constant for the process); its keyed merkle root is
+    # cached across forward passes within a mining job (bit-identical to fresh).
+    def _hash_weight(B=B, key_tensor=key_tensor, scratchpad=tensor_hash_scratchpad):
+        out = torch.empty(32, device="cuda", dtype=torch.uint8)
+        tensor_hash(B, key_tensor, out, scratchpad)
+        return out
+
+    B_tensor_hash = cached_weight_hash(B, hash_key, _hash_weight)
 
     # Generate commitment hash for noise generation
     commitment_hash_A_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
