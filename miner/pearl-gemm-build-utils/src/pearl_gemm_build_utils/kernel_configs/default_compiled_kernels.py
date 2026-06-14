@@ -40,12 +40,17 @@ def _fuse_noise_b_enabled() -> bool:
     )
 
 
-# B' fusion stages the int8 EBL ring in SMEM alongside A/B; drop the main GEMM
-# to 2 pipeline stages so the fused build fits the H100 SMEM limit.
-_matmul_stages = 2 if _fuse_noise_b_enabled() else 3
+# B' fusion: keep 3 pipeline stages, but the separate int8 EBL/EBR SMEM region
+# only fits the H100 limit at R=64 (at R=128 the fp16 denoise arm is already
+# ~192KB and EBL+EBR add ~48KB on top -> overflow). So when fused, build only
+# the R=64 matmul kernel. (R=128 fused needs a non-aliasing SMEM redesign;
+# tracked separately.) Stock (non-fused) build keeps both R=64 and R=128.
+_fused = _fuse_noise_b_enabled()
+_matmul_stages = 3
+_matmul_Rs = [64] if _fused else [64, 128]
 
-# 128x256x128, R=64/128
-for R in [64, 128]:
+# 128x256x128
+for R in _matmul_Rs:
     _matmul_kernels.append(
         MatmulKernelConfig(
             tile_size_m=128,

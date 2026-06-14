@@ -208,20 +208,6 @@ struct KernelTraits {
                             cutlass::detail::alignment_for_swizzle(
                                 SmemLayoutB{})>
             smem_B;
-#ifdef PEARL_FUSE_NOISE_B
-        // B' fusion: int8 EBL/EBR live DURING the mainloop alongside A/B, so
-        // they belong in this union arm. Arm stays smaller than the fp16
-        // denoise-factor arm below, so the union size (hence total SMEM) is
-        // unchanged vs the stock kernel.
-        cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBLi8>,
-                            cutlass::detail::alignment_for_swizzle(
-                                SmemLayoutEBLi8{})>
-            smem_EBLi8;
-        cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBRi8>,
-                            cutlass::detail::alignment_for_swizzle(
-                                SmemLayoutEBRi8{})>
-            smem_EBRi8;
-#endif
       };
 
       struct {
@@ -257,6 +243,16 @@ struct KernelTraits {
                             SmemLayoutScaleB{})>
         smem_scale_b;
 
+#ifdef PEARL_FUSE_NOISE_B
+    // B' fusion: int8 EBL/EBR staged for on-chip BpEB = B + int8(EBL*EBR).
+    cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBLi8>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayoutEBLi8{})>
+        smem_EBLi8;
+    cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBRi8>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayoutEBRi8{})>
+        smem_EBRi8;
+#endif
+
     struct {
       typename MainloopPipeline::SharedStorage pipeline;
       typename DenoisePipeline::SharedStorage AxEB_pipeline;
@@ -272,17 +268,6 @@ struct KernelTraits {
       cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutB>,
                           cutlass::detail::alignment_for_swizzle(SmemLayoutB{})>
           smem_B;
-#ifdef PEARL_FUSE_NOISE_B
-      // B' fusion: int8 EBL/EBR live with A/B during the mainloop.
-      cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBLi8>,
-                          cutlass::detail::alignment_for_swizzle(
-                              SmemLayoutEBLi8{})>
-          smem_EBLi8;
-      cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBRi8>,
-                          cutlass::detail::alignment_for_swizzle(
-                              SmemLayoutEBRi8{})>
-          smem_EBRi8;
-#endif
     };
 
     cute::array_aligned<ElementOut, cute::cosize_v<SmemLayoutC>,
@@ -297,6 +282,16 @@ struct KernelTraits {
                         cutlass::detail::alignment_for_swizzle(
                             SmemLayoutScaleB{})>
         smem_scale_b;
+
+#ifdef PEARL_FUSE_NOISE_B
+    // B' fusion: int8 EBL/EBR staged for on-chip BpEB = B + int8(EBL*EBR).
+    cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBLi8>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayoutEBLi8{})>
+        smem_EBLi8;
+    cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBRi8>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayoutEBRi8{})>
+        smem_EBRi8;
+#endif
 
     struct {
       typename MainloopPipeline::SharedStorage pipeline;
