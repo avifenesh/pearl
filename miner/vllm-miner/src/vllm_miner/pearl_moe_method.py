@@ -3,9 +3,11 @@ from typing import TYPE_CHECKING
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from miner_utils import get_logger
+from vllm import envs
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEActivationFormat,
     FusedMoEMethodBase,
+    FusedMoeWeightScaleSupported,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -27,7 +29,8 @@ WEIGHT_DTYPE = torch.int8
 SCALE_DTYPE = torch.float32
 SMOOTH_SCALE_DTYPE = torch.bfloat16
 SCALE_LAST_DIM = 1
-QUANT_METHOD_CHANNEL = "channel"
+QUANT_METHOD_CHANNEL = FusedMoeWeightScaleSupported.CHANNEL.value
+QUANT_METHOD_BLOCK = FusedMoeWeightScaleSupported.BLOCK.value
 W13_WEIGHT_SHARDS_WITH_ACT_AND_MUL = 2
 W13_WEIGHT_SHARDS_WITHOUT_ACT_AND_MUL = 1
 # Fused gate+up smooth scale: checkpoint provides one half; we replicate to the other.
@@ -36,6 +39,15 @@ W13_SMOOTH_PROJ_HALVES = 2
 W13_SMOOTH_SHARED_EXPERT_INDEX = 0
 # Per-layer pinned PoW headers held while a forward's callback is pending.
 MOE_POW_HEADER_POOL_DEPTH = 16
+
+# Down projection (GEMM2): not mined, kept in the original fp8 block quantization.
+W2_WEIGHT_DTYPE = torch.float8_e4m3fn
+W2_BLOCK_N = 128
+W2_BLOCK_K = 128
+W2_BLOCK_SHAPE = [W2_BLOCK_N, W2_BLOCK_K]
+
+MOE_BACKEND_AUTO = "auto"
+MOE_BACKEND_TRITON = "triton"
 
 
 class PearlMoEMethod(FusedMoEMethodBase):
@@ -73,9 +85,17 @@ class PearlMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
+        # Down projection: fp8 weights block-wise scales.
+        layer.weight_block_size = W2_BLOCK_SHAPE
+        n_tiles = (hidden_size + W2_BLOCK_N - 1) // W2_BLOCK_N
+        k_tiles = (intermediate_size_per_partition + W2_BLOCK_K - 1) // W2_BLOCK_K
+
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, hidden_size, intermediate_size_per_partition, dtype=WEIGHT_DTYPE
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=W2_WEIGHT_DTYPE,
             ),
             requires_grad=False,
         )
@@ -94,29 +114,22 @@ class PearlMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
         w2_weight_scale = torch.nn.Parameter(
-            torch.ones(num_experts, hidden_size, SCALE_LAST_DIM, dtype=SCALE_DTYPE),
+            torch.ones(num_experts, n_tiles, k_tiles, dtype=SCALE_DTYPE),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        extra_weight_attrs.update({"quant_method": QUANT_METHOD_CHANNEL})
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
-
-        smooth_attrs = dict(extra_weight_attrs)
-        w2_smooth_quant_scale = torch.nn.Parameter(
-            torch.ones(num_experts, intermediate_size_per_partition, dtype=SMOOTH_SCALE_DTYPE),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_smooth_quant_scale", w2_smooth_quant_scale)
-        set_weight_attrs(w2_smooth_quant_scale, smooth_attrs)
+        channel_attrs = dict(extra_weight_attrs, quant_method=QUANT_METHOD_CHANNEL)
+        set_weight_attrs(w13_weight_scale, channel_attrs)
+        block_attrs = dict(extra_weight_attrs, quant_method=QUANT_METHOD_BLOCK)
+        set_weight_attrs(w2_weight_scale, block_attrs)
 
         w13_smooth_quant_scale = torch.nn.Parameter(
             torch.ones(num_experts, 2 * hidden_size, dtype=SMOOTH_SCALE_DTYPE),
             requires_grad=False,
         )
         layer.register_parameter("w13_smooth_quant_scale", w13_smooth_quant_scale)
-        set_weight_attrs(w13_smooth_quant_scale, smooth_attrs)
+        set_weight_attrs(w13_smooth_quant_scale, dict(extra_weight_attrs))
 
         layer.w13_input_scale = None
         layer.w2_input_scale = None
@@ -131,9 +144,36 @@ class PearlMoEMethod(FusedMoEMethodBase):
             if w13_smooth.shape[0] > src + 1:
                 w13_smooth.data[src + 1 :] = w13_smooth.data[src : src + 1]
 
+        self._warn_if_backend_overridden()
+
         num_experts = layer.w13_weight.shape[0]
         ensure_pinned_pool_at_least(num_experts * MOE_POW_HEADER_POOL_DEPTH)
         self._setup_kernel(layer)
+
+    def _warn_if_backend_overridden(self) -> None:
+        """Warn when vLLM requests a MoE backend other than Triton."""
+
+        requested = getattr(self.moe, "moe_backend", MOE_BACKEND_AUTO)
+        if requested and requested not in (MOE_BACKEND_AUTO, MOE_BACKEND_TRITON):
+            self._warn_backend_ignored(requested)
+            return
+
+        if (envs.is_set("VLLM_USE_DEEP_GEMM") and envs.VLLM_USE_DEEP_GEMM) or (
+            envs.is_set("VLLM_MOE_USE_DEEP_GEMM") and envs.VLLM_MOE_USE_DEEP_GEMM
+        ):
+            self._warn_backend_ignored("deep_gemm")
+        elif envs.is_set("VLLM_USE_FLASHINFER_MOE_FP8") and envs.VLLM_USE_FLASHINFER_MOE_FP8:
+            self._warn_backend_ignored("flashinfer")
+
+    @staticmethod
+    def _warn_backend_ignored(
+        requested: str,
+    ) -> None:
+        _LOGGER.warning(
+            "Requested MoE backend '%s' is ignored for PearlMoE; the down "
+            "projection always uses the Triton fp8-block GEMM.",
+            requested,
+        )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:
         return FusedMoEQuantConfig.make(

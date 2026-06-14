@@ -63,7 +63,7 @@ LLAMA_8B = ModelTestConfig(
 
 QWEN3_MOE = ModelTestConfig(
     id="qwen3_moe",
-    model="pearl-ai/Qwen3-30B-A3B-Instruct-2507-pearl",
+    model="pearl-ai/Qwen3-30B-A3B-Instruct-2507-pearl-moe",
     prompt=(
         "<|im_start|>system\n"
         "You are a French translator. Reply with ONLY the French translation of the user's "

@@ -92,11 +92,21 @@ class PearlConfig(CompressedTensorsConfig):
 
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
 
-    def _moe_quant_args(self) -> tuple[QuantizationArgs | None, QuantizationArgs | None]:
-        for key in ("FusedMoE", "Linear"):
-            scheme_dict = self.target_scheme_map.get(key)
-            if scheme_dict:
-                return scheme_dict.get("weights"), scheme_dict.get("input_activations")
+    # Expert-0 projection name used to resolve the gate/up scheme of a FusedMoE
+    # layer (mirrors vLLM's CompressedTensorsMoEMethod.get_moe_method).
+    _GATE_UP_PROBE_SUFFIX = ".0.gate_proj"
+
+    def _moe_gate_up_quant_args(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> tuple[QuantizationArgs | None, QuantizationArgs | None]:
+        """Resolve the gate/up (GEMM1) quant args for a FusedMoE layer.
+
+        Pearl MoE checkpoints target each projection by regex, so we probe the
+        expert-0 gate projection to read the GEMM1 scheme.
+        """
+        scheme_dict = self.get_scheme_dict(layer, prefix + self._GATE_UP_PROBE_SUFFIX)
+        if scheme_dict:
+            return scheme_dict.get("weights"), scheme_dict.get("input_activations")
         return None, None
 
     @override
@@ -111,7 +121,7 @@ class PearlConfig(CompressedTensorsConfig):
         from .pearl_moe_method import PearlMoEMethod
 
         if isinstance(layer, FusedMoE):
-            weight_quant, input_quant = self._moe_quant_args()
+            weight_quant, input_quant = self._moe_gate_up_quant_args(layer, prefix)
             if self._is_mining_layer(weight_quant, input_quant):
                 _LOGGER.debug(f"Mining MoE layer (7-bit) detected for {prefix}")
                 return PearlMoEMethod(layer.moe_config)
