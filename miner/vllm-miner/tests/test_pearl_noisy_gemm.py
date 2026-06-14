@@ -407,3 +407,57 @@ def test_pearl_gemm_noisy_with_controlled_noise(make_random_test_matrices):
         )
     else:
         print("✓ Confirmed that denoising produces consistent results across runs")
+
+
+def test_weight_hash_cache_hits_invalidates_and_is_aba_safe():
+    """The static-weight hash cache must: return the computed value on a miss,
+    reuse it on a hit, recompute when the mining-job key changes, and never
+    return a stale value when a freed tensor's data_ptr is reused (ABA). A wrong
+    cached hash would silently corrupt the PoW commitment, so this is the guard.
+    """
+    import gc
+
+    from vllm_miner import weight_hash_cache as whc
+
+    calls = {"n": 0}
+
+    def make_hash(tag: int):
+        def _compute():
+            calls["n"] += 1
+            return torch.tensor([tag] * 32, dtype=torch.uint8)
+
+        return _compute
+
+    whc.clear_cache()
+    w = torch.zeros(256, dtype=torch.int8)
+    k1, k2 = b"\x01" * 32, b"\x02" * 32
+
+    h1 = whc.cached_weight_hash(w, k1, make_hash(1))  # miss -> compute
+    h2 = whc.cached_weight_hash(w, k1, make_hash(9))  # hit -> cached (compute not called)
+    assert h1.tolist() == [1] * 32
+    assert h2 is h1, "repeat call with same tensor+key must reuse the cached value"
+    assert calls["n"] == 1, "a hit must not recompute"
+
+    h3 = whc.cached_weight_hash(w, k2, make_hash(2))  # key change -> recompute
+    assert h3.tolist() == [2] * 32 and calls["n"] == 2, "key change must recompute"
+
+    # ABA: free w, reuse its address with a different tensor -> must NOT false-hit.
+    whc.clear_cache()
+    calls["n"] = 0
+    a = torch.zeros(256, dtype=torch.int8)
+    whc.cached_weight_hash(a, k1, make_hash(1))
+    del a
+    gc.collect()
+    b = torch.zeros(256, dtype=torch.int8)  # may reuse the freed address
+    out = whc.cached_weight_hash(b, k1, make_hash(2))
+    assert out.tolist() == [2] * 32, "a different (live) tensor must recompute, even if addr reused"
+
+    # GC finalizer: a cached weight that is freed must auto-evict its entry.
+    whc.clear_cache()
+    c = torch.zeros(256, dtype=torch.int8)
+    whc.cached_weight_hash(c, k1, make_hash(1))
+    assert whc.cache_size() == 1
+    del c
+    gc.collect()
+    assert whc.cache_size() == 0, "freeing a cached weight must evict its entry"
+    whc.clear_cache()
