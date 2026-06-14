@@ -303,6 +303,14 @@ struct CollectiveMainloop {
         pipeline.producer_acquire(smem_pipe_write);
         BarrierType* tmaBar = pipeline.producer_get_barrier(smem_pipe_write);
         auto stage = smem_pipe_write.index();
+        if constexpr (FuseNoiseB) {
+          // producer_acquire armed the mbarrier for A+B bytes only; the EBL/EBR
+          // TMA loads below deliver to the SAME barrier, so extend the expected
+          // transaction count or consumer_wait never completes (deadlock).
+          uint32_t extra = TmaTransactionBytesEBL;
+          if (k_tile == 0) extra += TmaTransactionBytesEBR;
+          pipeline.producer_expect_transaction(smem_pipe_write, extra);
+        }
         copy(mainloop_params.tma_load_A.with(*tmaBar, tma_mcast_mask_a),
              tAgA(_, k_tile), tAsA(_, stage));
         copy(mainloop_params.tma_load_B.with(*tmaBar, tma_mcast_mask_b),
@@ -340,12 +348,9 @@ struct CollectiveMainloop {
             copy(mainloop_params.tma_load_EBR.with(*tmaBar, 0), tRgR, tRsR);
           }
         }
-        uint32_t commit_bytes = TmaTransactionBytes;
-        if constexpr (FuseNoiseB) {
-          commit_bytes += TmaTransactionBytesEBL;
-          if (k_tile == 0) commit_bytes += TmaTransactionBytesEBR;
-        }
-        pipeline.producer_commit(smem_pipe_write, commit_bytes);
+        // producer_commit's byte arg is a NOP for TMA pipelines (the TMA's own
+        // completion + producer_expect_transaction above drive the mbarrier).
+        pipeline.producer_commit(smem_pipe_write, TmaTransactionBytes);
         ++smem_pipe_write;
       }
     }
