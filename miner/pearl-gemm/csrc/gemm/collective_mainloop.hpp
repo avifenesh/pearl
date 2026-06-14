@@ -424,6 +424,9 @@ struct CollectiveMainloop {
     auto r2s_thr_copy_B = r2s_tiled_copy_B.get_slice(thread_idx);
 
     // E_B = EBR * EBL
+#ifdef PEARL_FUSE_DEBUG
+    if (thread_idx == 0) printf("[FNB]  A: pre WGMMA\n");
+#endif
     clear(tCrEB);
     warpgroup_fence_operand(tCrEB);
     warpgroup_arrive();
@@ -431,6 +434,9 @@ struct CollectiveMainloop {
     warpgroup_commit_batch();
     warpgroup_wait<0>();
     warpgroup_fence_operand(tCrEB);
+#ifdef PEARL_FUSE_DEBUG
+    if (thread_idx == 0) printf("[FNB]  B: post WGMMA\n");
+#endif
 
     // Load current (raw) B tile from swizzled sB into registers.
     cute::copy(s2r_tiled_copy_B, taccCsB(_, _, _, stage), taccCrB);
@@ -438,6 +444,9 @@ struct CollectiveMainloop {
         cutlass::NumThreadsPerWarpGroup,
         static_cast<uint32_t>(pearl::NamedBarriers::S2RCopyBDone));
     cutlass::arch::fence_view_async_shared();
+#ifdef PEARL_FUSE_DEBUG
+    if (thread_idx == 0) printf("[FNB]  C: post S2R+sync\n");
+#endif
 
     // Narrow E_B int32 -> int8 (exact; noise is in-range), shuffle, add to B.
     pearl::convert_type_out(tCrEB, tCrEB_int8);
@@ -454,6 +463,9 @@ struct CollectiveMainloop {
     cutlass::arch::NamedBarrier::sync(
         cutlass::NumThreadsPerWarpGroup,
         static_cast<uint32_t>(pearl::NamedBarriers::S2RCopyBDone));
+#ifdef PEARL_FUSE_DEBUG
+    if (thread_idx == 0) printf("[FNB]  D: post R2S+sync\n");
+#endif
   }
 
   template <typename SharedStorage, typename FrgTensorC,
@@ -512,12 +524,22 @@ struct CollectiveMainloop {
         // noising_B reference; all MMA warpgroups then sync before reading sB.
         if (mainloop_params.ptr_EBR != nullptr &&
             mainloop_params.ptr_EBL_R_major != nullptr) {
+#ifdef PEARL_FUSE_DEBUG
+          if (thread_idx == 0) printf("[FNB] enter k_tile stage=%d\n", stage);
+#endif
           if (thread_idx < cutlass::NumThreadsPerWarpGroup) {
             fuse_noise_b_inplace(shared_storage, stage, thread_idx);
           }
+#ifdef PEARL_FUSE_DEBUG
+          if (thread_idx == 0) printf("[FNB] pre FuseNoiseBReady\n");
+          if (thread_idx == 128) printf("[FNB] WG1 pre FuseNoiseBReady\n");
+#endif
           cutlass::arch::NamedBarrier::sync(
               kNumMmaThreads,
               static_cast<uint32_t>(pearl::NamedBarriers::FuseNoiseBReady));
+#ifdef PEARL_FUSE_DEBUG
+          if (thread_idx == 0) printf("[FNB] post FuseNoiseBReady\n");
+#endif
         }
       }
 
