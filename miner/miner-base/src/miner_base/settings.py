@@ -34,4 +34,12 @@ class MinerSettings(BaseSettings):
     no_vllm_plugin: bool = False
     quantization_fast_math: bool = False
 
+    # Cache the noised weight BpEB = B + E_BL@E_BR per (weight, mining job).
+    # BpEB depends only on the mining-job key and the static weight (not the
+    # activation), so it is identical across every forward pass within a job;
+    # caching it skips re-forming + re-writing the n x k int8 weight noising on
+    # the large FFN matmuls. Bit-identical to recompute (the job key is part of
+    # the cache key); off by default.
+    cache_noised_weight: bool = False
+
     enable_async_cuda_event_processing: bool = True
