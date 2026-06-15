@@ -8,11 +8,13 @@ from pearl_gemm import (
     get_host_signal_sync_size,
     get_required_scratchpad_bytes,
     make_pow_target_tensor,
+    noise_B,
     noise_gen,
     noisy_gemm,
     tensor_hash,
 )
 
+from .bpeb_cache import cached_noised_weight
 from .callbacks import (
     StatusCheckCallback,
 )
@@ -168,9 +170,53 @@ def pearl_gemm_noisy(
         a.device,
     )
 
-    # Always compute B noising (depends on A through EAR)
+    # B-side noising: BpEB = B + EBL@EBR is A-INDEPENDENT (seeded by commitment_B,
+    # = blake3(job_key || merkle_root(B))), so it is identical across every forward
+    # pass within a mining job. Optionally cache it per (weight, commitment_B) and
+    # skip re-forming + re-writing the n x k int8 weight noising. The denoise
+    # side-product EARxBpEB = EAR @ BpEB is A-DEPENDENT (EAR is seeded by
+    # commitment_A) and is ALWAYS recomputed fresh from the cached BpEB, so the
+    # proof-of-work path is bit-unchanged.
     BpEB = torch.empty((n, k), dtype=torch.int8, device=a.device)
     EARxBpEB = torch.empty((n, r), dtype=torch.float16, device=a.device)
+
+    use_bpeb_cache = (
+        config.settings.cache_noised_weight
+        and layer is not None
+        and B.is_contiguous()
+    )
+    bpeb_cached = None
+    if use_bpeb_cache:
+        commitment_b_bytes = bytes(commitment_hash_B_tensor.cpu().numpy().tobytes())
+
+        def _noise_b(B=B, EBR=EBR, EAR_K_major=EAR_K_major, EBL_R_major=EBL_R_major):
+            # Produce ONLY BpEB (the cacheable, A-independent noised weight) via the
+            # standalone noise_B op; EARxBpEB it also writes here is discarded and
+            # recomputed fresh per call below.
+            bpeb_out = torch.empty((n, k), dtype=torch.int8, device=a.device)
+            earxbpeb_scratch = torch.empty((n, r), dtype=torch.float16, device=a.device)
+            noise_B(
+                B=B,
+                EBR=EBR,
+                EARxBpEB=earxbpeb_scratch,
+                BpEB=bpeb_out,
+                EAR=EAR_K_major,
+                EBL=EBL_R_major,
+            )
+            return bpeb_out
+
+        bpeb_cached = cached_noised_weight(B, commitment_b_bytes, _noise_b)
+        BpEB = bpeb_cached
+        # Recompute the A-dependent side-product from the cached weight:
+        # EARxBpEB = EAR @ BpEB (int32 reduction; the kernel's denoise_converter
+        # scales int32 -> fp16). Matches miner_base reference noise_B exactly.
+        # The kernel requires BOTH an int32 input and an fp16 output buffer
+        # (denoise converter writes int32 -> fp16), so allocate both.
+        EARxBpEB_int32 = torch.empty((n, r), dtype=torch.int32, device=a.device)
+        torch.matmul(
+            EAR_K_major.to(torch.int32), BpEB.to(torch.int32), out=EARxBpEB_int32
+        )
+        EARxBpEB = torch.empty((n, r), dtype=torch.float16, device=a.device)
 
     # Allocate A noising tensors (input-dependent)
     ApEA = torch.empty((m, k), dtype=torch.int8, device=a.device)
@@ -183,7 +229,9 @@ def pearl_gemm_noisy(
     # Create pow_target tensor from adjusted_target
     pow_target_tensor = make_pow_target_tensor(adjusted_target)
 
-    # Run noisy GEMM with default kernel configurations
+    # Run noisy GEMM with default kernel configurations.
+    # When BpEB is cached, skip the B-noising launch (run_noising_B=False): the
+    # main GEMM consumes the supplied cached BpEB + freshly-recomputed EARxBpEB.
     noisy_gemm(
         A=A,  # Input matrix A (m x k)
         B=B,  # Input matrix B (n x k)
@@ -196,7 +244,8 @@ def pearl_gemm_noisy(
         EAR_K_major=EAR_K_major,
         EBL_K_major=EBL_K_major,
         AxEBL_fp16=A_E_BL,  # Intermediate tensor A * E_BL (m x r)
-        EARxBpEB_fp16=EARxBpEB,  # Output tensor for EAR * BpEB (n x r)
+        EARxBpEB_fp16=EARxBpEB,  # fp16 output buffer (denoise converter target)
+        EARxBpEB_int32=EARxBpEB_int32 if use_bpeb_cache else None,
         ApEA=ApEA,  # Output tensor for A + EA (m x k)
         BpEB=BpEB,  # Output tensor for B + EB (n x k)
         A_scales=A_scales,  # Scale factors for A
@@ -210,7 +259,7 @@ def pearl_gemm_noisy(
         tile_size_n=config.settings.tile_size_n,
         tile_size_k=config.settings.tile_size_k,
         run_noising_A=True,  # run_noising_A
-        run_noising_B=True,  # run_noising_B
+        run_noising_B=not use_bpeb_cache,  # skip B-noising when BpEB is cached
         skip_reduction=False,  # skip_reduction
         skip_denoising=False,  # skip_denoising
     )
@@ -244,7 +293,10 @@ def pearl_gemm_noisy(
 
     del pow_target_tensor
     del ApEA
-    del BpEB
+    # BpEB may be a cache-owned tensor (do not release it back to the allocator
+    # while the cache holds a reference); drop only our local binding.
+    if bpeb_cached is None:
+        del BpEB
     del A_E_BL
     del EAL
     del EBR
@@ -260,6 +312,8 @@ def pearl_gemm_noisy(
     del tensor_hash_scratchpad
     del host_signal_sync
     del EARxBpEB
+    if use_bpeb_cache:
+        del EARxBpEB_int32
     return C
 
 
