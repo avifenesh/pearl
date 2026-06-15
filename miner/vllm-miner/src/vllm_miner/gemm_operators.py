@@ -172,13 +172,20 @@ def pearl_gemm_noisy(
         a.device,
     )
 
-    # B-side noising: BpEB = B + EBL@EBR is A-INDEPENDENT (seeded by commitment_B,
-    # = blake3(job_key || merkle_root(B))), so it is identical across every forward
-    # pass within a mining job. Optionally cache it per (weight, commitment_B) and
-    # skip re-forming + re-writing the n x k int8 weight noising. The denoise
-    # side-product EARxBpEB = EAR @ BpEB is A-DEPENDENT (EAR is seeded by
-    # commitment_A) and is ALWAYS recomputed fresh from the cached BpEB, so the
-    # proof-of-work path is bit-unchanged.
+    # B-side noising. BpEB = B + EBL@EBR is A-INDEPENDENT (seeded by commitment_B
+    # = blake3(job_key || merkle_root(B))), so it is byte-identical across every
+    # forward pass within a mining job (proven vs miner_base; and on H100 the GEMM
+    # output C is bit-exact when a precomputed BpEB is supplied with
+    # run_noising_B=False). The mining job rotates ~1/s while a forward is ~ms, so
+    # caching BpEB per (weight, job) turns the dominant, m-independent weight-noising
+    # (forming EBL@EBR + the n x k int8 HBM write, ~0.17 ms/layer on gate_up) into a
+    # once-per-job cost that amortizes to ~0 over a long prefill.
+    #
+    # The denoise side-product EARxBpEB = BpEB @ EAR is A-DEPENDENT (EAR is seeded by
+    # commitment_A) and is recomputed fresh every call from the cached BpEB. Its
+    # values are small integers that fit exactly in fp32, so an fp32 matmul with TF32
+    # disabled is bit-exact and GPU-native (CUDA has no int matmul). The PoW path is
+    # therefore bit-unchanged on a hit.
     BpEB = torch.empty((n, k), dtype=torch.int8, device=a.device)
     EARxBpEB = torch.empty((n, r), dtype=torch.float16, device=a.device)
 
@@ -188,37 +195,31 @@ def pearl_gemm_noisy(
         and B.is_contiguous()
     )
     bpeb_cached = None
+    EARxBpEB_int32 = None
     if use_bpeb_cache:
         commitment_b_bytes = bytes(commitment_hash_B_tensor.cpu().numpy().tobytes())
 
-        def _noise_b(B=B, EBR=EBR, EAR_K_major=EAR_K_major, EBL_R_major=EBL_R_major):
-            # Produce ONLY BpEB (the cacheable, A-independent noised weight) via the
-            # standalone noise_B op; EARxBpEB it also writes here is discarded and
-            # recomputed fresh per call below.
+        def _form_bpeb(B=B, EBR=EBR, EAR_K_major=EAR_K_major, EBL_R_major=EBL_R_major):
+            # Form BpEB once per (weight, job) via the standalone noise_B op (the
+            # EARxBpEB it also writes is scratch — recomputed fresh below).
             bpeb_out = torch.empty((n, k), dtype=torch.int8, device=a.device)
-            earxbpeb_scratch = torch.empty((n, r), dtype=torch.float16, device=a.device)
-            noise_B(
-                B=B,
-                EBR=EBR,
-                EARxBpEB=earxbpeb_scratch,
-                BpEB=bpeb_out,
-                EAR=EAR_K_major,
-                EBL=EBL_R_major,
-            )
+            scratch = torch.empty((n, r), dtype=torch.float16, device=a.device)
+            noise_B(B=B, EBR=EBR, EARxBpEB=scratch, BpEB=bpeb_out,
+                    EAR=EAR_K_major, EBL=EBL_R_major)
             return bpeb_out
 
-        bpeb_cached = cached_noised_weight(B, commitment_b_bytes, _noise_b)
+        bpeb_cached = cached_noised_weight(B, commitment_b_bytes, _form_bpeb)
         BpEB = bpeb_cached
-        # Recompute the A-dependent side-product from the cached weight:
-        # EARxBpEB = EAR @ BpEB (int32 reduction; the kernel's denoise_converter
-        # scales int32 -> fp16). Matches miner_base reference noise_B exactly.
-        # The kernel requires BOTH an int32 input and an fp16 output buffer
-        # (denoise converter writes int32 -> fp16), so allocate both.
+        # EARxBpEB = BpEB(n x k) @ EAR_R_major(k x r) -> (n x r), as int32 (the
+        # kernel's denoise converter scales int32 -> fp16). fp32 + TF32 off is
+        # bit-exact for these small-integer values; verified on H100.
         EARxBpEB_int32 = torch.empty((n, r), dtype=torch.int32, device=a.device)
-        torch.matmul(
-            EAR_K_major.to(torch.int32), BpEB.to(torch.int32), out=EARxBpEB_int32
+        _prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        EARxBpEB_int32.copy_(
+            (BpEB.to(torch.float32) @ EAR_R_major.to(torch.float32)).to(torch.int32)
         )
-        EARxBpEB = torch.empty((n, r), dtype=torch.float16, device=a.device)
+        torch.backends.cuda.matmul.allow_tf32 = _prev_tf32
 
     # Allocate A noising tensors (input-dependent)
     ApEA = torch.empty((m, k), dtype=torch.int8, device=a.device)
@@ -231,9 +232,7 @@ def pearl_gemm_noisy(
     # Create pow_target tensor from adjusted_target
     pow_target_tensor = make_pow_target_tensor(adjusted_target)
 
-    # Run noisy GEMM with default kernel configurations.
-    # When BpEB is cached, skip the B-noising launch (run_noising_B=False): the
-    # main GEMM consumes the supplied cached BpEB + freshly-recomputed EARxBpEB.
+    # Run noisy GEMM with default kernel configurations
     noisy_gemm(
         A=A,  # Input matrix A (m x k)
         B=B,  # Input matrix B (n x k)
@@ -246,8 +245,8 @@ def pearl_gemm_noisy(
         EAR_K_major=EAR_K_major,
         EBL_K_major=EBL_K_major,
         AxEBL_fp16=A_E_BL,  # Intermediate tensor A * E_BL (m x r)
-        EARxBpEB_fp16=EARxBpEB,  # fp16 output buffer (denoise converter target)
-        EARxBpEB_int32=EARxBpEB_int32 if use_bpeb_cache else None,
+        EARxBpEB_fp16=EARxBpEB,  # fp16 output buffer (denoise-converter target on the cached path)
+        EARxBpEB_int32=EARxBpEB_int32,  # set on a cache hit; the GEMM skips B-noising
         ApEA=ApEA,  # Output tensor for A + EA (m x k)
         BpEB=BpEB,  # Output tensor for B + EB (n x k)
         A_scales=A_scales,  # Scale factors for A
@@ -295,8 +294,7 @@ def pearl_gemm_noisy(
 
     del pow_target_tensor
     del ApEA
-    # BpEB may be a cache-owned tensor (do not release it back to the allocator
-    # while the cache holds a reference); drop only our local binding.
+    # BpEB may be cache-owned (the cache holds a ref); drop only our local binding.
     if bpeb_cached is None:
         del BpEB
     del A_E_BL
@@ -314,7 +312,7 @@ def pearl_gemm_noisy(
     del tensor_hash_scratchpad
     del host_signal_sync
     del EARxBpEB
-    if use_bpeb_cache:
+    if EARxBpEB_int32 is not None:
         del EARxBpEB_int32
     return C
 
