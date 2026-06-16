@@ -22,7 +22,8 @@ commitment_B)` under the immutable-weight invariant because
 key avoids a GPU sync just to copy `commitment_B` back to Python. On a cache hit
 the main GEMM runs with `run_noising_B=False` (an existing kernel flag) and
 consumes the cached weight instead of re-noising it; the main GEMM already reads
-its B operand from `ptr_BpEB`. Off by default (`MINER_CACHE_NOISED_WEIGHT=1`).
+its B operand from `ptr_BpEB`. Off by default; enable with
+`MINER_CACHE_NOISED_WEIGHT=1`.
 
 ## The A-dependent side-product (why this is not just `run_noising_B=False`)
 The noisingB kernel produces TWO things: `BpEB` (A-independent, cached) and the
