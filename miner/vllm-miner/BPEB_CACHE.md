@@ -16,10 +16,13 @@ matmuls (Step-0: gate_up B-side +0.167 ms of the +0.20 ms noising; `BpEB` = 117 
 > L2, so its formation + HBM write is real bandwidth paid every forward). Over a
 long prefill that cost amortizes to ~0 when cached.
 
-This caches `BpEB` per `(weight, commitment_B)`. On a cache hit the main GEMM runs
-with `run_noising_B=False` (an existing kernel flag) and consumes the cached
-weight instead of re-noising it; the main GEMM already reads its B operand from
-`ptr_BpEB`. Off by default (`MINER_CACHE_NOISED_WEIGHT=1`).
+This caches `BpEB` per `(weight, job_key)`, which is equivalent to `(weight,
+commitment_B)` under the immutable-weight invariant because
+`commitment_B = blake3(job_key || merkle_root(B))`. Keying on the already-CPU job
+key avoids a GPU sync just to copy `commitment_B` back to Python. On a cache hit
+the main GEMM runs with `run_noising_B=False` (an existing kernel flag) and
+consumes the cached weight instead of re-noising it; the main GEMM already reads
+its B operand from `ptr_BpEB`. Off by default (`MINER_CACHE_NOISED_WEIGHT=1`).
 
 ## The A-dependent side-product (why this is not just `run_noising_B=False`)
 The noisingB kernel produces TWO things: `BpEB` (A-independent, cached) and the
@@ -42,7 +45,7 @@ are unchanged. Validated on H100 (sm_90, real kernels): driving `noisy_gemm` wit
 a precomputed BpEB + run_noising_B=False vs full noising gives **C exact-equal,
 max|dC| = 0.000e+00**. Every uncertainty degrades to a redundant recompute, never
 a wrong weight:
-- `commitment_B` bytes are part of the cache key -> a new mining job misses;
+- mining-job key bytes are part of the cache key -> a new mining job misses;
 - a `weakref` to the exact weight is checked on a hit -> a freed/reused `data_ptr`
   (ABA) misses and recomputes;
 - `device` (type + index) is in the key -> CUDA `data_ptr` ints that collide

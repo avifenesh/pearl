@@ -6,6 +6,7 @@ from miner_utils import get_logger
 from pearl_gateway.config import MinerRpcConfig
 from pearl_gemm import HostSignalHeaderPinnedPool
 
+from .bpeb_cache import clear_cache as clear_bpeb_cache
 from .config import config
 
 _LOGGER = get_logger("vllm.pearl_miner")
@@ -34,6 +35,7 @@ def init_async_manager(miner_settings: MinerSettings | None = None) -> None:
             miner_settings,
         )
         _async_manager.start()
+        _async_manager.register_mining_job_changed_callback(clear_bpeb_cache)
         config.settings = miner_settings
         _LOGGER.info(f"Mining state initalized, {miner_settings=}")
 

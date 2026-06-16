@@ -2,7 +2,7 @@
 
 These test the CACHE SEMANTICS in isolation (no GPU / no kernels): a miss
 computes, a repeat hit returns the same object without recomputing, a mining-job
-change (different commitment_B) recomputes, ABA (a freed/reused data_ptr) does
+change (different job key) recomputes, ABA (a freed/reused data_ptr) does
 not false-hit, and the byte budget bounds memory. The numerical
 bit-exactness of reusing BpEB across forward passes within a job is proven
 separately against miner_base in pearl-pr-plan/proofs/prove_bpeb_invariant.py
@@ -55,7 +55,7 @@ def test_job_change_recomputes():
 
     a = cached_noised_weight(w, b"job-A" + b"\x00" * 27, compute)
     b = cached_noised_weight(w, b"job-B" + b"\x00" * 27, compute)
-    assert calls["n"] == 2, "a new commitment_B (job change) must recompute"
+    assert calls["n"] == 2, "a new job key must recompute"
     assert not torch.equal(a, b)
     # cache holds the latest; the stale job-A bytes were reclaimed (one live entry).
     assert cache_size() == 1

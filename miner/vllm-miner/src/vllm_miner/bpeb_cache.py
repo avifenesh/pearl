@@ -15,12 +15,16 @@ on every forward pass -- the dominant, m-independent half of the mining tax on
 large FFN weights (forming ``E_BL @ E_BR`` plus a full ``n x k`` int8 write that
 overflows L2; ~0.17 ms/layer on gate_up on H100).
 
-This caches ``BpEB`` keyed by ``(weight, commitment_B)``. A cached value is
-ALWAYS bit-identical to recomputing, so the proof-of-work path is unchanged; any
-uncertainty degrades to a redundant recompute, never a wrong weight:
+This caches ``BpEB`` keyed by ``(weight, mining-job key)``. For an immutable
+weight this is equivalent to ``(weight, commitment_B)`` because
+``commitment_B = blake3(key || merkle_root(B))``; using the already-CPU job key
+avoids synchronizing the GPU just to copy ``commitment_B`` back to Python. A
+cached value is ALWAYS bit-identical to recomputing, so the proof-of-work path is
+unchanged; any uncertainty degrades to a redundant recompute, never a wrong
+weight:
 
-* the mining-job ``commitment_B`` bytes are part of the cache key -> a new job
-  misses and recomputes;
+* the mining-job key bytes are part of the cache key -> a new job misses and
+  recomputes;
 * a ``weakref`` to the exact weight tensor is checked on a hit -> a freed/reused
   ``data_ptr`` (ABA) misses and recomputes;
 * ``device`` (type + index) is part of the key -> CUDA ``data_ptr`` ints that
@@ -53,7 +57,7 @@ from collections.abc import Callable
 
 import torch
 
-# cache_key -> (commitment_B bytes, weakref(weight), BpEB tensor, nbytes)
+# cache_key -> (job key bytes, weakref(weight), BpEB tensor, nbytes)
 _CACHE: dict[tuple, tuple] = {}
 
 # Backstop for non-collectable churn. BpEB tensors are large (n*k int8), so bound
@@ -64,12 +68,12 @@ _cur_bytes = 0
 
 def cached_noised_weight(
     weight: torch.Tensor,
-    commitment_b: bytes,
+    job_key: bytes,
     compute: Callable[[], torch.Tensor],
 ) -> torch.Tensor:
     """Return the noised weight ``BpEB`` for ``weight`` under the current mining
     job, reusing a cached value only when the exact same (still-alive) weight
-    tensor and mining-job ``commitment_b`` are unchanged.
+    tensor and mining-job key are unchanged.
 
     On any miss it calls ``compute()`` (which must produce ``BpEB``) and caches
     the result; the returned tensor is always identical to recomputing.
@@ -88,8 +92,8 @@ def cached_noised_weight(
     )
     entry = _CACHE.get(cache_key)
     if entry is not None:
-        cached_cb, weak_weight, cached_bpeb, _nbytes = entry
-        if cached_cb == commitment_b and weak_weight() is weight:
+        cached_job_key, weak_weight, cached_bpeb, _nbytes = entry
+        if cached_job_key == job_key and weak_weight() is weight:
             return cached_bpeb
 
     result = compute()
@@ -118,7 +122,7 @@ def cached_noised_weight(
     if _cur_bytes + nbytes > _MAX_BYTES:  # backstop: don't grow unbounded
         _CACHE.clear()
         _cur_bytes = 0
-    _CACHE[cache_key] = (commitment_b, weak_weight, result, nbytes)
+    _CACHE[cache_key] = (job_key, weak_weight, result, nbytes)
     _cur_bytes += nbytes
     return result
 

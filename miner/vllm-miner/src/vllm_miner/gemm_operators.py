@@ -197,8 +197,6 @@ def pearl_gemm_noisy(
     bpeb_cached = None
     EARxBpEB_int32 = None
     if use_bpeb_cache:
-        commitment_b_bytes = bytes(commitment_hash_B_tensor.cpu().numpy().tobytes())
-
         def _form_bpeb(B=B, EBR=EBR, EAR_K_major=EAR_K_major, EBL_R_major=EBL_R_major):
             # Form BpEB once per (weight, job) via the standalone noise_B op (the
             # EARxBpEB it also writes is scratch — recomputed fresh below).
@@ -208,18 +206,20 @@ def pearl_gemm_noisy(
                     EAR=EAR_K_major, EBL=EBL_R_major)
             return bpeb_out
 
-        bpeb_cached = cached_noised_weight(B, commitment_b_bytes, _form_bpeb)
+        bpeb_cached = cached_noised_weight(B, hash_key, _form_bpeb)
         BpEB = bpeb_cached
         # EARxBpEB = BpEB(n x k) @ EAR_R_major(k x r) -> (n x r), as int32 (the
         # kernel's denoise converter scales int32 -> fp16). fp32 + TF32 off is
         # bit-exact for these small-integer values; verified on H100.
         EARxBpEB_int32 = torch.empty((n, r), dtype=torch.int32, device=a.device)
         _prev_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        EARxBpEB_int32.copy_(
-            (BpEB.to(torch.float32) @ EAR_R_major.to(torch.float32)).to(torch.int32)
-        )
-        torch.backends.cuda.matmul.allow_tf32 = _prev_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            EARxBpEB_int32.copy_(
+                (BpEB.to(torch.float32) @ EAR_R_major.to(torch.float32)).to(torch.int32)
+            )
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = _prev_tf32
 
     # Allocate A noising tensors (input-dependent)
     ApEA = torch.empty((m, k), dtype=torch.int8, device=a.device)
