@@ -517,6 +517,82 @@ struct CollectiveMainloop {
     HashAccumulator hash_accumulator(last_full_k_block,
                                      mainloop_params.inner_hash_counter);
 
+    // Whether B-noise fusion is active at runtime (noise factors present).
+    const bool do_fuse =
+        FuseNoiseB && mainloop_params.ptr_EBR != nullptr &&
+        mainloop_params.ptr_EBL_R_major != nullptr;
+
+    if constexpr (FuseNoiseB) {
+      if (do_fuse) {
+        // ===================================================================
+        // V2: software-pipeline the B-noise ONE STAGE AHEAD of the main GEMM.
+        // Noise(stage k+1) is formed while the main GEMM consumes stage k, so
+        // the noise WGMMA (idle tensor cores during the memory-bound mainloop)
+        // overlaps the main WGMMA instead of serializing before it. The ring
+        // gives noise(k+1) a different sB slot than gemm(k) reads, so there is
+        // no in-place hazard across the overlap (requires kStages >= 2).
+        // ===================================================================
+        PipelineState noise_pipe = smem_pipe_read;  // leads the gemm pointer
+
+        // Prologue: wait for + noise stage 0 (the first tile the GEMM consumes).
+        pipeline.consumer_wait(noise_pipe);
+        fuse_noise_b_inplace(shared_storage, noise_pipe.index(), thread_idx);
+        // Make BpEB(stage 0) visible to all MMA threads before any GEMM reads it.
+        cutlass::arch::NamedBarrier::sync(
+            kNumMmaThreads,
+            static_cast<uint32_t>(pearl::NamedBarriers::FuseNoiseBReady));
+        ++noise_pipe;
+
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
+          if constexpr (!SkipReduction) {
+            hash_accumulator.preload(transcript_extraction_tensor);
+          }
+          auto stage = smem_pipe_read.index();
+
+          // Issue noise for the NEXT tile first, so its WGMMA is in flight while
+          // this tile's main GEMM runs (overlap on the async tensor pipeline).
+          if (k_tile + 1 < k_tile_count) {
+            pipeline.consumer_wait(noise_pipe);
+            fuse_noise_b_inplace(shared_storage, noise_pipe.index(), thread_idx);
+          }
+
+          // Main GEMM on this (already-noised) tile.
+          CUTLASS_PRAGMA_UNROLL
+          for (int k_block = 0; k_block < k_blocks_per_tile; ++k_block) {
+            warpgroup_fence_operand(tCrC);
+            warpgroup_arrive();
+            gemm(tiled_mma, tCrA(_, _, k_block, stage),
+                 tCrB(_, _, k_block, stage), tCrC);
+            warpgroup_commit_batch();
+            if constexpr (!SkipReduction) {
+              hash_accumulator.accumulate(tCrC, k_block);
+            }
+          }
+          if constexpr (!SkipReduction) {
+            hash_accumulator.writeback(transcript_extraction_tensor);
+          }
+          warpgroup_wait<0>();
+          // Now that this tile's GEMM is done, the next tile's noise (issued
+          // above) must be globally visible before its GEMM next iteration.
+          if (k_tile + 1 < k_tile_count) {
+            cutlass::arch::NamedBarrier::sync(
+                kNumMmaThreads,
+                static_cast<uint32_t>(pearl::NamedBarriers::FuseNoiseBReady));
+            ++noise_pipe;
+          }
+          pipeline.consumer_release(smem_pipe_read);
+          ++smem_pipe_read;
+        }
+        // Notify producer that main gemm is complete
+        cutlass::arch::NamedBarrier::arrive(
+            kNumMmaThreads + cutlass::NumThreadsPerWarp,
+            static_cast<cutlass::arch::ReservedNamedBarriers>(
+                pearl::NamedBarriers::MmaComplete));
+        return;
+      }
+    }
+
     CUTLASS_PRAGMA_NO_UNROLL
     for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
       if constexpr (!SkipReduction) {
@@ -526,30 +602,6 @@ struct CollectiveMainloop {
       // Wait for TMA to load this stage of the pipeline
       pipeline.consumer_wait(smem_pipe_read);
       auto stage = smem_pipe_read.index();
-
-      if constexpr (FuseNoiseB) {
-        // Transform raw B in sB[stage] -> BpEB = B + int8(EBL*EBR), in place,
-        // before the main GEMM consumes it. Only when noise factors are present.
-        // V1: runs on ALL MMA warpgroups (both WGs split the bN tile) so noise
-        // formation is parallel, not a single-WG serial pre-pass.
-        if (mainloop_params.ptr_EBR != nullptr &&
-            mainloop_params.ptr_EBL_R_major != nullptr) {
-#ifdef PEARL_FUSE_DEBUG
-          if (thread_idx == 0) printf("[FNB] enter k_tile stage=%d\n", stage);
-#endif
-          fuse_noise_b_inplace(shared_storage, stage, thread_idx);
-#ifdef PEARL_FUSE_DEBUG
-          if (thread_idx == 0) printf("[FNB] pre FuseNoiseBReady\n");
-          if (thread_idx == 128) printf("[FNB] WG1 pre FuseNoiseBReady\n");
-#endif
-          cutlass::arch::NamedBarrier::sync(
-              kNumMmaThreads,
-              static_cast<uint32_t>(pearl::NamedBarriers::FuseNoiseBReady));
-#ifdef PEARL_FUSE_DEBUG
-          if (thread_idx == 0) printf("[FNB] post FuseNoiseBReady\n");
-#endif
-        }
-      }
 
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < k_blocks_per_tile; ++k_block) {
