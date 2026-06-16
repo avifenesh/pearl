@@ -251,6 +251,11 @@ struct KernelTraits {
     cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBRi8>,
                         cutlass::detail::alignment_for_swizzle(SmemLayoutEBRi8{})>
         smem_EBRi8;
+#ifdef PEARL_FUSE_NOISE_B_V3
+    cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutB>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayoutB{})>
+        smem_BpEB;  // V3 decoupled BpEB buffer
+#endif
 #endif
 
     struct {
@@ -291,6 +296,11 @@ struct KernelTraits {
     cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutEBRi8>,
                         cutlass::detail::alignment_for_swizzle(SmemLayoutEBRi8{})>
         smem_EBRi8;
+#ifdef PEARL_FUSE_NOISE_B_V3
+    cute::array_aligned<ElementIn, cute::cosize_v<SmemLayoutB>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayoutB{})>
+        smem_BpEB;  // V3 decoupled BpEB buffer
+#endif
 #endif
 
     struct {

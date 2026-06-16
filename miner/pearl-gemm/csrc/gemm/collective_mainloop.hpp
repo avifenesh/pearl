@@ -465,9 +465,18 @@ struct CollectiveMainloop {
     for (int i = 0; i < size(taccCrB_int8); ++i) {
       taccCrB_int8[i] += tCrEB_int8[i];
     }
-    // Write BpEB back into the swizzled sB[stage] (R2S), in place. One barrier
-    // ensures the write is complete + visible before the main GEMM reads sB.
+    // Write BpEB (R2S). V3: into the DECOUPLED smem_BpEB[stage] (leaving raw sB
+    // intact); else in-place into sB[stage]. One barrier ensures the write is
+    // complete + visible before the main GEMM reads its B operand.
+#ifdef PEARL_FUSE_NOISE_B_V3
+    Tensor sBpEB = make_tensor(make_smem_ptr(shared_storage.smem_BpEB.data()),
+                               SmemLayoutB{});
+    Tensor sBpEB_pi = as_position_independent_swizzle_tensor(sBpEB);
+    auto sBpEB_u16 = recast<uint16_t>(sBpEB_pi);
+    auto taccCsB_w = r2s_thr_copy_B.partition_D(sBpEB_u16);
+#else
     auto taccCsB_w = r2s_thr_copy_B.partition_D(sB_u16);
+#endif
     cute::copy(r2s_tiled_copy_B, taccCrB, taccCsB_w(_, _, _, stage));
     cutlass::arch::fence_view_async_shared();
     cutlass::arch::NamedBarrier::sync(
@@ -497,7 +506,17 @@ struct CollectiveMainloop {
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
 
     Tensor tCsA = thr_mma.partition_A(sA);  // (MMA,MMA_M,MMA_K,PIPE)
+#ifdef PEARL_FUSE_NOISE_B_V3
+    // V3: the main GEMM reads its B operand from the DECOUPLED BpEB buffer (the
+    // noise path writes BpEB here, never in-place into sB), so the consumer never
+    // RMWs the operand it is about to multiply -> no per-tile noise barrier in the
+    // GEMM critical path.
+    Tensor sBpEB = make_tensor(make_smem_ptr(shared_storage.smem_BpEB.data()),
+                               SmemLayoutB{});
+    Tensor tCsB = thr_mma.partition_B(sBpEB);  // (MMA,MMA_N,MMA_K,PIPE)
+#else
     Tensor tCsB = thr_mma.partition_B(sB);  // (MMA,MMA_N,MMA_K,PIPE)
+#endif
 
     // Allocate "fragments" -- these are WGMMA matrix descriptors
     Tensor tCrA = thr_mma.make_fragment_A(tCsA);  // (MMA,MMA_M,MMA_K,PIPE)

@@ -67,6 +67,10 @@ DISABLE_R128 = _env_flag("PEARL_GEMM_DISABLE_R128", "FALSE")
 # B' fusion (experimental): form BpEB on-chip in the GEMM mainloop instead of a
 # separate noising_B kernel + HBM round-trip. Default OFF (byte-identical build).
 FUSE_NOISE_B = _env_flag("PEARL_FUSE_NOISE_B", "FALSE")
+# V3: decoupled BpEB buffer (separate SMEM) so the GEMM consumer reads a clean
+# noised-B operand instead of RMWing sB in place. Tests whether decoupling removes
+# the per-tile noise barrier stall. Costs an extra B-sized SMEM pipeline.
+FUSE_NOISE_B_V3 = _env_flag("PEARL_FUSE_NOISE_B_V3", "FALSE")
 FUSE_DEBUG = _env_flag("PEARL_FUSE_DEBUG", "FALSE")
 
 SKIP_CPP_GENERATION = _env_flag("PEARL_GEMM_SKIP_CPP_GENERATION", "FALSE")
@@ -79,6 +83,7 @@ FEATURE_FLAGS = {
     "DISABLE_R64": DISABLE_R64,
     "DISABLE_R128": DISABLE_R128,
     "PEARL_FUSE_NOISE_B": FUSE_NOISE_B,
+    "PEARL_FUSE_NOISE_B_V3": FUSE_NOISE_B_V3,
     "PEARL_FUSE_DEBUG": FUSE_DEBUG,
 }
 
