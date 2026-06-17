@@ -25,6 +25,14 @@ consumes the cached weight instead of re-noising it; the main GEMM already reads
 its B operand from `ptr_BpEB`. Off by default; enable with
 `MINER_CACHE_NOISED_WEIGHT=1`.
 
+For serving experiments, `MINER_CACHE_NOISED_WEIGHT_READY_FILE=/path/to/file`
+can defer cache use until after vLLM startup/profiling. If set, cache hits are
+disabled until the file exists; this avoids charging cached tensors against the
+KV-cache memory budget during vLLM profiling.
+
+`MINER_CACHE_NOISED_WEIGHT_LOG_INTERVAL=N` logs JSON cache counters every N
+lookups. Use this only while benchmarking.
+
 ## The A-dependent side-product (why this is not just `run_noising_B=False`)
 The noisingB kernel produces TWO things: `BpEB` (A-independent, cached) and the
 denoise side-product `EARxBpEB = BpEB @ E_AR` (A-DEPENDENT — `E_AR` is seeded by
@@ -32,11 +40,10 @@ denoise side-product `EARxBpEB = BpEB @ E_AR` (A-DEPENDENT — `E_AR` is seeded 
 needs `EARxBpEB` every call, so it is NEVER cached — it is recomputed fresh from
 the cached `BpEB` each forward pass.
 
-`E_AR` is a structured-sparse selection matrix and `BpEB` is int8, so the entries
-of `EARxBpEB` are small integers that fit exactly in fp32's 24-bit mantissa.
-CUDA has no integer matmul, but an **fp32 matmul with TF32 disabled is bit-exact**
-for these values and runs on the GPU (no CPU round-trip). We feed it as int32 and
-let the kernel's existing denoise converter scale int32 -> fp16, matching the
+`E_AR` is a structured-sparse selection matrix and `BpEB` is int8, so the cache
+hit path recomputes `EARxBpEB` with a dedicated CUDA product:
+`BpEB(n x k) @ EAR_K_major(r x k).T -> int32(n x r)`. The result is fed to the
+kernel's existing denoise converter, which scales int32 -> fp16, matching the
 miner_base reference `noise_B` exactly.
 
 ## Why it's correct (PoW-equivalent) — validated bit-exact on H100
@@ -59,7 +66,8 @@ Valid under the immutable-weight invariant (Pearl weights are persistent
   weight). Apply only to the large FFN weights where it pays; a byte budget
   (default 2 GiB) bounds the cache as a backstop.
 - We replace the BpEB FORMATION + the `n x k` int8 HBM write (the expensive part)
-  with a cache read; the cheaper `EARxBpEB` reduction stays per-call.
+  with a cache read; the smaller `EARxBpEB` product stays per-call and now runs
+  through the dedicated CUDA side-product op.
 - On a cache MISS, `BpEB` is formed via the standalone `noise_B` op and stored;
   the win is on subsequent hits within the same job.
 - The win is amortized over the prefill share of compute (big on prefill-heavy
@@ -67,9 +75,118 @@ Valid under the immutable-weight invariant (Pearl weights are persistent
 
 ## Validation
 - Cache semantics: `tests/test_bpeb_cache.py` (CPU, no kernels) — miss/hit/
-  job-change/distinct-weights/weakref-evict/byte-budget. 8/8 pass.
+  job-change/distinct-weights/weakref-evict/byte-budget/admission stats. 9/9 pass.
 - Invariant (BpEB ⟂ A, deterministic in commitment_B): proven vs miner_base in
   pearl-pr-plan/proofs/prove_bpeb_invariant.py.
 - Bit-exact equivalence on H100 (kernel level + the shipped pearl_gemm_noisy with
   the flag on vs off): pearl-pr-plan/modal_bpeb_validate.py.
-- Pending for the PR description: the amortized prefill req/s A/B (cache off vs on).
+- H100 kernel microbench with the CUDA side-product: steady-state cache hits are
+  faster on the tested prefill-shaped GEMMs; report exact workload numbers in the
+  PR text, not as a default claim.
+
+## Serving benchmark result
+Modal H100, tp=1, `max_model_len=4096`, `gpu_memory_utilization=0.93`,
+2770 prompt tokens/request, `PearlKernel` plugin hits = 200 per request.
+
+Early cache allocation (plain `MINER_CACHE_NOISED_WEIGHT=1`) reduced vLLM KV
+capacity and still lost latency (Modal result
+`/tmp/pearl-modal-results/bpeb-server-H100-tp1-ctx4096-20260617T022327Z.json`):
+- cache off: median 0.561552 s, mean 0.562682 s, KV 3.69 GiB / 12,080 tokens /
+  2.95x concurrency
+- cache on: median 0.606051 s, mean 0.609670 s, KV 1.54 GiB / 5,024 tokens /
+  1.23x concurrency
+- result: -7.34% median, -7.71% mean
+
+Deferred cache allocation (`MINER_CACHE_NOISED_WEIGHT_READY_FILE` created after
+`/v1/models` readiness) preserved the KV budget but still lost latency (Modal
+run `ap-eEiAEEjLpqxc2K3duiEGGa`, result
+`/tmp/pearl-modal-results/bpeb-server-H100-tp1-ctx4096-20260617T042007Z.json`):
+- cache off: median 0.517003 s, mean 0.519665 s, KV 3.69 GiB / 12,080 tokens /
+  2.95x concurrency
+- cache on: median 0.558280 s, mean 0.557966 s, KV 3.69 GiB / 12,080 tokens /
+  2.95x concurrency
+- result: -7.39% median, -6.86% mean
+
+Follow-up H100 kernel-only bench showed an isolated cache hit is not the problem
+for a representative prefill-shaped layer (`m=2770, n=14336, k=8192, r=128`;
+Modal result
+`/tmp/pearl-modal-results/bpeb-hit-path-H100-20260617T044025Z.json`):
+- `noise_B_fp16`: median 0.180192 ms
+- `bpeb_ear_product_int32`: median 0.092320 ms
+- `denoise_converter_ear_only`: median 0.017584 ms
+- full `noisy_gemm`: median 0.808656 ms
+- cached-hit sequence (`bpeb_ear_product` + skip-B `noisy_gemm`): median
+  0.711248 ms
+- result: isolated cached hit is +13.7% faster for this shape
+
+A smaller-object/fusion probe added a no-store B-side noising mode that still
+forms each `BpEB` tile in shared memory and computes `EARxBpEB`, but skips the
+global `n x k` `BpEB` write. It is bit-exact against `noise_B` for
+`EARxBpEB`. On the same H100 shape (Modal run `ap-jXFvq8kpU0ZNbyoFwA7Yox`,
+result `/tmp/pearl-modal-results/bpeb-hit-path-H100-20260617T062620Z.json`):
+- `noise_B_fp16`: median 0.182208 ms
+- `noise_B_side_product_fp16`: median 0.160432 ms
+- result: no-store side-product is +13.6% faster inside `noise_B`, but only
+  saves 0.021776 ms absolute for this layer
+
+This says the standalone `BpEB` write is measurable but not the dominant cost.
+A true mainloop fusion could also remove the later `BpEB` read, but the current
+no-store probe by itself is not a production path because the existing main GEMM
+still needs a full `BpEB` operand.
+
+But the serving cache had effectively no hits. A stats run with deferred cache,
+one warmup plus one measured request, and `MINER_CACHE_NOISED_WEIGHT_LOG_INTERVAL=25`
+(Modal run `ap-lg090XVkcxjFvTb33oZPGp`, result
+`/tmp/pearl-modal-results/bpeb-server-H100-tp1-ctx4096-20260617T051832Z.json`)
+ended with:
+- lookups: 400
+- hits: 0
+- misses/stores: 400
+- over-budget clears: 46
+- final entries: 4
+- final bytes: 1.02 GiB of a 2 GiB budget
+- serving result: cache off 0.516696 s, cache on 0.546583 s (-5.47%)
+
+Selective admission (preserve the resident subset and skip admission instead of
+clearing when the byte budget is full) fixed the zero-hit thrash but still lost
+latency. The deferred-cache 2 GiB serving run with
+`MINER_CACHE_NOISED_WEIGHT_MAX_BYTES=2147483648` and
+`MINER_CACHE_NOISED_WEIGHT_LOG_INTERVAL=25` (Modal run
+`ap-GQSW2nETj3AgguX0ot9J9p`, result
+`/tmp/pearl-modal-results/bpeb-server-H100-tp1-ctx4096-20260617T054756Z.json`)
+ended with:
+- cache off: median/mean 0.538894 s
+- cache on: median/mean 0.584089 s
+- result: -7.74% median/mean
+- final cache lookups: 400
+- final hits: 8
+- final misses: 392
+- final stores: 8
+- admission skips: 384
+- over-budget clears: 0
+- final entries: 8
+- final bytes: exactly 2.00 GiB of a 2 GiB budget
+
+Doubling that to 4 GiB doubled the resident subset and hit count but made latency
+worse (Modal run `ap-82mknOM6h03jLN0MAuuA7k`, result
+`/tmp/pearl-modal-results/bpeb-server-H100-tp1-ctx4096-20260617T055408Z.json`):
+- cache off: median/mean 0.569111 s
+- cache on: median/mean 0.632656 s
+- result: -10.04% median/mean
+- final cache lookups: 400
+- final hits: 16
+- final misses: 384
+- final stores: 16
+- admission skips: 368
+- over-budget clears: 0
+- final entries: 16
+- final bytes: exactly 4.00 GiB of a 4 GiB budget
+
+Conclusion: allocation timing is a real hidden parameter for vLLM capacity, and
+the isolated full-`BpEB` hit path can be faster. Selective admission proves that
+a bounded resident full-`BpEB` cache can avoid destructive clears, but the useful
+reuse is far too sparse at realistic budgets: 2 GiB gives 8 repeated hits and
+4 GiB gives 16, while hundreds of lookups still pay miss cost. Full `BpEB`
+caching should not be a PR as-is; a plausible next target must reduce the cached
+object size or avoid the full-weight working-set problem, not merely tune the
+hit-path kernel.

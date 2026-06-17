@@ -1,8 +1,12 @@
+import json
+import os
+
 import torch
 from miner_base.commitment_hash import CommitmentHasher
 from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
 from miner_utils import get_logger
 from pearl_gemm import (
+    bpeb_ear_product,
     commitment_hash_from_merkle_roots,
     gemm,
     get_host_signal_sync_size,
@@ -14,7 +18,7 @@ from pearl_gemm import (
     tensor_hash,
 )
 
-from .bpeb_cache import cached_noised_weight
+from .bpeb_cache import cache_stats, cached_noised_weight
 from .callbacks import (
     StatusCheckCallback,
 )
@@ -26,6 +30,24 @@ from .mining_state import (
 from .weight_hash_cache import cached_weight_hash
 
 _LOGGER = get_logger("vllm.pearl_miner")
+
+
+def _noised_weight_cache_ready() -> bool:
+    ready_file = config.settings.cache_noised_weight_ready_file
+    if not ready_file:
+        return True
+    return os.path.exists(ready_file)
+
+
+def _maybe_log_noised_weight_cache_stats() -> None:
+    interval = config.settings.cache_noised_weight_log_interval
+    if interval <= 0:
+        return
+    stats = cache_stats()
+    stats["configured_max_bytes"] = config.settings.cache_noised_weight_max_bytes
+    lookups = stats["lookups"]
+    if lookups > 0 and lookups % interval == 0:
+        _LOGGER.info("BpEB cache stats: " + json.dumps(stats, sort_keys=True))
 
 
 def pearl_gemm_vanilla(
@@ -182,15 +204,16 @@ def pearl_gemm_noisy(
     # once-per-job cost that amortizes to ~0 over a long prefill.
     #
     # The denoise side-product EARxBpEB = BpEB @ EAR is A-DEPENDENT (EAR is seeded by
-    # commitment_A) and is recomputed fresh every call from the cached BpEB. Its
-    # values are small integers that fit exactly in fp32, so an fp32 matmul with TF32
-    # disabled is bit-exact and GPU-native (CUDA has no int matmul). The PoW path is
+    # commitment_A) and is recomputed fresh every call from the cached BpEB. The cache
+    # hit path computes it with the same int8 x int8 -> int32 CUDA product as noisingB,
+    # then lets the existing denoise converter scale int32 -> fp16. The PoW path is
     # therefore bit-unchanged on a hit.
     BpEB = torch.empty((n, k), dtype=torch.int8, device=a.device)
     EARxBpEB = torch.empty((n, r), dtype=torch.float16, device=a.device)
 
     use_bpeb_cache = (
         config.settings.cache_noised_weight
+        and _noised_weight_cache_ready()
         and layer is not None
         and B.is_contiguous()
     )
@@ -206,20 +229,18 @@ def pearl_gemm_noisy(
                     EAR=EAR_K_major, EBL=EBL_R_major)
             return bpeb_out
 
-        bpeb_cached = cached_noised_weight(B, hash_key, _form_bpeb)
+        bpeb_cached = cached_noised_weight(
+            B,
+            hash_key,
+            _form_bpeb,
+            max_bytes=config.settings.cache_noised_weight_max_bytes,
+        )
+        _maybe_log_noised_weight_cache_stats()
         BpEB = bpeb_cached
-        # EARxBpEB = BpEB(n x k) @ EAR_R_major(k x r) -> (n x r), as int32 (the
-        # kernel's denoise converter scales int32 -> fp16). fp32 + TF32 off is
-        # bit-exact for these small-integer values; verified on H100.
+        # EARxBpEB = BpEB(n x k) @ EAR_K_major(r x k).T -> (n x r), as int32. This
+        # mirrors the full noise_B layout and feeds the existing denoise converter.
         EARxBpEB_int32 = torch.empty((n, r), dtype=torch.int32, device=a.device)
-        _prev_tf32 = torch.backends.cuda.matmul.allow_tf32
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = False
-            EARxBpEB_int32.copy_(
-                (BpEB.to(torch.float32) @ EAR_R_major.to(torch.float32)).to(torch.int32)
-            )
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = _prev_tf32
+        bpeb_ear_product(BpEB=BpEB, EAR=EAR_K_major, EARxBpEB=EARxBpEB_int32)
 
     # Allocate A noising tensors (input-dependent)
     ApEA = torch.empty((m, k), dtype=torch.int8, device=a.device)

@@ -14,7 +14,7 @@
 #include <thrust/host_vector.h>
 
 template <typename ElementDenoise_EARxBpEB, class TileShape_NRK, int kStages,
-          bool IsEvenK = false>
+          bool IsEvenK = false, bool StoreBpEB = true>
 void run_pearl_noising_B(PearlAPIParams const& params,
                          cudaStream_t stream = 0) {
   using namespace cute;
@@ -24,7 +24,7 @@ void run_pearl_noising_B(PearlAPIParams const& params,
   static constexpr bool NoReduction = !(cute::is_same_v<ElementDenoise, int>);
   using NoisingKernelB =
       pearl::NoisingKernelB<TileShape_NRK, 128, Element, ElementDenoise,
-                            kStages, IsEvenK, NoReduction>;
+                            kStages, IsEvenK, NoReduction, StoreBpEB>;
 
   int total_k_blocks = ceil_div(params.k, get<2>(TileShape_NRK{}));
   bool no_reduce = NoReduction || params.k_blocks_per_split_noising_B <= 0;

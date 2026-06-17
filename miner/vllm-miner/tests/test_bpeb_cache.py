@@ -15,8 +15,10 @@ import torch
 from vllm_miner.bpeb_cache import (
     cache_bytes,
     cache_size,
+    cache_stats,
     cached_noised_weight,
     clear_cache,
+    reset_cache_stats,
 )
 
 
@@ -26,6 +28,7 @@ def _weight(n=8, k=16):
 
 def setup_function(_):
     clear_cache()
+    reset_cache_stats()
 
 
 def test_miss_computes_then_hit_does_not_recompute():
@@ -122,3 +125,71 @@ def test_byte_budget_is_tracked_and_reclaimed():
     assert cache_bytes() == out.element_size() * out.nelement() == 128
     clear_cache()
     assert cache_bytes() == 0 and cache_size() == 0
+
+
+def test_cache_stats_count_misses_hits_and_stores():
+    w = _weight()
+    cb = b"job-A" + b"\x00" * 27
+    cached_noised_weight(w, cb, lambda: torch.zeros_like(w))
+    cached_noised_weight(w, cb, lambda: torch.full_like(w, 1))
+
+    stats = cache_stats()
+    assert stats["lookups"] == 2
+    assert stats["misses"] == 1
+    assert stats["hits"] == 1
+    assert stats["stores"] == 1
+    assert stats["entries"] == 1
+    assert stats["bytes"] == 128
+
+
+def test_over_budget_miss_skips_admission_and_preserves_resident_entry():
+    cb = b"job-A" + b"\x00" * 27
+    w1 = _weight()
+    w2 = _weight()
+    calls = {"w1": 0, "w2": 0}
+
+    def compute_w1():
+        calls["w1"] += 1
+        return torch.full_like(w1, 1)
+
+    def compute_w2():
+        calls["w2"] += 1
+        return torch.full_like(w2, 2)
+
+    out1 = cached_noised_weight(w1, cb, compute_w1, max_bytes=128)
+    out2 = cached_noised_weight(w2, cb, compute_w2, max_bytes=128)
+    out1_again = cached_noised_weight(w1, cb, compute_w1, max_bytes=128)
+
+    assert calls == {"w1": 1, "w2": 1}
+    assert out1_again is out1
+    assert torch.equal(out2, torch.full_like(w2, 2))
+    assert cache_size() == 1
+    assert cache_bytes() == 128
+
+    stats = cache_stats()
+    assert stats["lookups"] == 3
+    assert stats["hits"] == 1
+    assert stats["misses"] == 2
+    assert stats["stores"] == 1
+    assert stats["admission_skips"] == 1
+    assert stats["over_budget_clears"] == 0
+
+
+def test_oversize_result_is_not_cached():
+    cb = b"job-A" + b"\x00" * 27
+    w = _weight()
+    calls = {"n": 0}
+
+    def compute():
+        calls["n"] += 1
+        return torch.full_like(w, calls["n"])
+
+    first = cached_noised_weight(w, cb, compute, max_bytes=64)
+    second = cached_noised_weight(w, cb, compute, max_bytes=64)
+
+    assert calls["n"] == 2
+    assert not torch.equal(first, second)
+    assert cache_size() == 0
+    stats = cache_stats()
+    assert stats["admission_skips"] == 2
+    assert stats["oversize_skips"] == 2

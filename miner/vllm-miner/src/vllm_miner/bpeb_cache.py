@@ -64,12 +64,26 @@ _CACHE: dict[tuple, tuple] = {}
 # total cached bytes rather than entry count. 2 GiB ~= a handful of big FFN weights.
 _MAX_BYTES = 2 * 1024 * 1024 * 1024
 _cur_bytes = 0
+_STATS: dict[str, int] = {
+    "lookups": 0,
+    "hits": 0,
+    "misses": 0,
+    "stores": 0,
+    "evictions": 0,
+    "clears": 0,
+    "over_budget_clears": 0,
+    "admission_skips": 0,
+    "oversize_skips": 0,
+    "stale_replacements": 0,
+    "weakref_skips": 0,
+}
 
 
 def cached_noised_weight(
     weight: torch.Tensor,
     job_key: bytes,
     compute: Callable[[], torch.Tensor],
+    max_bytes: int | None = None,
 ) -> torch.Tensor:
     """Return the noised weight ``BpEB`` for ``weight`` under the current mining
     job, reusing a cached value only when the exact same (still-alive) weight
@@ -83,6 +97,8 @@ def cached_noised_weight(
     ``EARxBpEB`` on every call (it is never cached).
     """
     global _cur_bytes
+    byte_budget = _MAX_BYTES if max_bytes is None else max_bytes
+    _STATS["lookups"] += 1
     cache_key = (
         weight.device.type,
         weight.device.index,
@@ -94,8 +110,10 @@ def cached_noised_weight(
     if entry is not None:
         cached_job_key, weak_weight, cached_bpeb, _nbytes = entry
         if cached_job_key == job_key and weak_weight() is weight:
+            _STATS["hits"] += 1
             return cached_bpeb
 
+    _STATS["misses"] += 1
     result = compute()
 
     # Register a finalizer so the entry is dropped as soon as `weight` is GC'd
@@ -108,10 +126,12 @@ def cached_noised_weight(
         if e is not None and e[1] is ref:
             _cur_bytes -= e[3]
             _CACHE.pop(key, None)
+            _STATS["evictions"] += 1
 
     try:
         weak_weight = weakref.ref(weight, _evict)
     except TypeError:
+        _STATS["weakref_skips"] += 1
         return result  # not weak-referenceable: skip caching (still correct)
 
     nbytes = result.element_size() * result.nelement()
@@ -119,11 +139,23 @@ def cached_noised_weight(
     old = _CACHE.get(cache_key)
     if old is not None:
         _cur_bytes -= old[3]
-    if _cur_bytes + nbytes > _MAX_BYTES:  # backstop: don't grow unbounded
-        _CACHE.clear()
-        _cur_bytes = 0
+        _CACHE.pop(cache_key, None)
+        _STATS["stale_replacements"] += 1
+
+    if nbytes > byte_budget:
+        _STATS["admission_skips"] += 1
+        _STATS["oversize_skips"] += 1
+        return result
+    if _cur_bytes + nbytes > byte_budget:
+        # Selective admission: preserve the resident subset and compute this
+        # weight uncached. Clearing here made sequential model traversals chase
+        # the current layer and produced zero hits on the next request.
+        _STATS["admission_skips"] += 1
+        return result
+
     _CACHE[cache_key] = (job_key, weak_weight, result, nbytes)
     _cur_bytes += nbytes
+    _STATS["stores"] += 1
     return result
 
 
@@ -132,6 +164,7 @@ def clear_cache() -> None:
     global _cur_bytes
     _CACHE.clear()
     _cur_bytes = 0
+    _STATS["clears"] += 1
 
 
 def cache_size() -> int:
@@ -142,3 +175,19 @@ def cache_size() -> int:
 def cache_bytes() -> int:
     """Total bytes held by cached BpEB tensors (introspection/test helper)."""
     return _cur_bytes
+
+
+def cache_stats() -> dict[str, int]:
+    """Return live noised-weight cache counters (introspection/debug helper)."""
+    return {
+        **_STATS,
+        "entries": len(_CACHE),
+        "bytes": _cur_bytes,
+        "default_max_bytes": _MAX_BYTES,
+    }
+
+
+def reset_cache_stats() -> None:
+    """Reset noised-weight cache counters (test helper)."""
+    for key in _STATS:
+        _STATS[key] = 0

@@ -6,10 +6,12 @@ import torch
 from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
 from miner_base.matmul_config import MatmulConfig
 from pearl_gemm import (
+    bpeb_ear_product,
     denoise_converter,
     gemm,
     noise_A,
     noise_B,
+    noise_B_side_product,
     noisy_gemm,
 )
 from pearl_gemm.testing import GEMMParam, GemmTensorGenerator
@@ -87,6 +89,20 @@ class TestPearlGEMMBase:
             tensor_generator.EBR,
             tensor_generator.EARxBpEB,
             tensor_generator.BpEB,
+            EAR=tensor_generator.EAR_K_major,
+            EBL=tensor_generator.EBL_R_major,
+            tile_size_n=gemm_params.tile_size_n_noising_B,
+            tile_size_k=gemm_params.tile_size_k_noising_B,
+            pipeline_stages=gemm_params.pipeline_stages_noising_B,
+            k_blocks_per_split=gemm_params.k_blocks_per_split_noising_B,
+        )
+        torch.cuda.synchronize()
+
+    def run_noise_B_side_product(self, tensor_generator, gemm_params):
+        noise_B_side_product(
+            tensor_generator.B,
+            tensor_generator.EBR,
+            tensor_generator.EARxBpEB,
             EAR=tensor_generator.EAR_K_major,
             EBL=tensor_generator.EBL_R_major,
             tile_size_n=gemm_params.tile_size_n_noising_B,
@@ -459,7 +475,10 @@ class TestNoiseB(TestPearlGEMMBase):
             noising_b_config=noising_b_config,
             k_blocks_per_split_noising_B=k_blocks_per_split_noising_B,
         )
-        if k_blocks_per_split_noising_B != 0 and gemm_params.EARxBpEB_type_noising == torch.float16:
+        if (
+            k_blocks_per_split_noising_B != 0
+            and gemm_params.EARxBpEB_type_noising == torch.float16
+        ):
             pytest.skip()
         tg = GemmTensorGenerator(gemm_params)
         tg.generate()
@@ -488,7 +507,10 @@ class TestNoiseB(TestPearlGEMMBase):
             noising_b_config=noising_b_config,
             k_blocks_per_split_noising_B=k_blocks_per_split_noising_B,
         )
-        if k_blocks_per_split_noising_B != 0 and gemm_params.EARxBpEB_type_noising == torch.float16:
+        if (
+            k_blocks_per_split_noising_B != 0
+            and gemm_params.EARxBpEB_type_noising == torch.float16
+        ):
             pytest.skip()
         tg = GemmTensorGenerator(gemm_params)
         tg.generate()
@@ -548,6 +570,84 @@ class TestNoiseB(TestPearlGEMMBase):
 
         assert torch.equal(EARxBpEB_ref, tg.EARxBpEB.cpu())
         assert torch.equal(BpEB_ref, tg.BpEB.to(torch.int32).cpu())
+
+    @pytest.mark.parametrize("m", [128])
+    @pytest.mark.parametrize(
+        ("n", "k"),
+        [
+            (128, 256),
+            (1024, 512),
+            (1024, 8192),
+            (1032, 80),
+            (130, 144),
+        ],
+    )
+    @pytest.mark.parametrize("k_blocks_per_split", [0, 1, None])
+    @pytest.mark.parametrize(
+        "noising_b_config",
+        [cfg for cfg in noise_b_kernels if cfg.EARxBpEB_type == "int32"],
+    )
+    def test_bpeb_ear_product_matches_noise_b(
+        self, m, n, k, k_blocks_per_split, noising_b_config
+    ):
+        gemm_params = GEMMParam(
+            m,
+            n,
+            k,
+            noising_b_config=noising_b_config,
+            k_blocks_per_split_noising_B=k_blocks_per_split,
+        )
+        tg = GemmTensorGenerator(gemm_params)
+        tg.generate()
+
+        self.run_noise_B(tg, gemm_params)
+        EARxBpEB_ref = tg.EARxBpEB.clone()
+        EARxBpEB_from_cached = torch.empty_like(tg.EARxBpEB)
+
+        bpeb_ear_product(
+            tg.BpEB,
+            tg.EAR_K_major,
+            EARxBpEB_from_cached,
+            tile_size_n=gemm_params.tile_size_n_noising_B,
+            tile_size_k=gemm_params.tile_size_k_noising_B,
+            pipeline_stages=gemm_params.pipeline_stages_noising_B,
+            k_blocks_per_split=k_blocks_per_split,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(EARxBpEB_ref, EARxBpEB_from_cached)
+
+    @pytest.mark.parametrize("m", [128])
+    @pytest.mark.parametrize("n", [128, 1024, 1032])
+    @pytest.mark.parametrize("k", [256, 512, 8192])
+    @pytest.mark.parametrize("k_blocks_per_split_noising_B", [0, 1, None])
+    @pytest.mark.parametrize("noising_b_config", noise_b_kernels)
+    def test_noise_b_side_product_matches_noise_b_without_storing_bpeb(
+        self, m, n, k, k_blocks_per_split_noising_B, noising_b_config
+    ):
+        gemm_params = GEMMParam(
+            m,
+            n,
+            k,
+            noising_b_config=noising_b_config,
+            k_blocks_per_split_noising_B=k_blocks_per_split_noising_B,
+        )
+        if k_blocks_per_split_noising_B != 0 and gemm_params.EARxBpEB_type_noising == torch.float16:
+            pytest.skip()
+        tg = GemmTensorGenerator(gemm_params)
+        tg.generate()
+
+        self.run_noise_B(tg, gemm_params)
+        EARxBpEB_ref = tg.EARxBpEB.clone()
+        BpEB_ref = tg.BpEB.clone()
+        tg.EARxBpEB.zero_()
+        tg.BpEB.zero_()
+
+        self.run_noise_B_side_product(tg, gemm_params)
+
+        assert torch.equal(EARxBpEB_ref, tg.EARxBpEB)
+        assert not torch.equal(BpEB_ref, tg.BpEB)
+        assert torch.count_nonzero(tg.BpEB) == 0
 
     @pytest.mark.parametrize("m", [512])
     @pytest.mark.parametrize("n", [512, 1024])

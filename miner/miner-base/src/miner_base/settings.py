@@ -41,5 +41,8 @@ class MinerSettings(BaseSettings):
     # the large FFN matmuls. Bit-identical to recompute (the job key is part of
     # the cache key); off by default.
     cache_noised_weight: bool = False
+    cache_noised_weight_ready_file: str | None = None
+    cache_noised_weight_log_interval: int = 0
+    cache_noised_weight_max_bytes: int = 2 * 1024 * 1024 * 1024
 
     enable_async_cuda_event_processing: bool = True

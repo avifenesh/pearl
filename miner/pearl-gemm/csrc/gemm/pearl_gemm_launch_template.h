@@ -25,14 +25,15 @@ void run_pearl_noising_A_(PearlAPIParams& params, cudaStream_t stream = 0) {
 }
 
 template <class ElementDenoise_EARxBpEB, int R, int bN_noising, int bK_noising,
-          int kStages>
+          int kStages, bool StoreBpEB = true>
 void run_pearl_noising_B_(PearlAPIParams& params, cudaStream_t stream = 0) {
   using namespace cute;
   using TileShape_NRK = Shape<Int<bN_noising>, Int<R>, Int<bK_noising>>;
 
   BOOL_SWITCH(params.k % get<2>(TileShape_NRK{}) == 0, IsEvenKNoising,
               run_pearl_noising_B<ElementDenoise_EARxBpEB, TileShape_NRK,
-                                  kStages, IsEvenKNoising>(params, stream););
+                                  kStages, IsEvenKNoising, StoreBpEB>(
+                  params, stream););
 }
 
 template <class ElementOut, int R, int bM, int bN, int bK, int kStages,

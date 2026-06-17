@@ -22,7 +22,8 @@ namespace pearl {
 using namespace cute;
 
 template <class TileShape_NRK_, int kNumThreads, class Element,
-          class ElementDenoise, int kStages, bool IsEvenK, bool NoReduction>
+          class ElementDenoise, int kStages, bool IsEvenK, bool NoReduction,
+          bool StoreBpEB>
 class NoisingKernelB {
 
  public:
@@ -845,10 +846,12 @@ class NoisingKernelB {
     compute_EARxBpEB(params, pipeline_BpEB, pipeline_EAR, shared_storage,
                      tCrEARxBpEB, n_block, k_block_min, k_block_max, tid);
 
-    // Wait for BpEB store warp to finish before reusing SMEM for EARxBpEB store
-    cutlass::arch::NamedBarrier::sync(
-        kNumEARxBpEBThreads + kNumBpEBStoreThreads,
-        static_cast<uint32_t>(NamedBarriers::EARxBpEBSMEMReady));
+    if constexpr (StoreBpEB) {
+      // Wait for BpEB store warp to finish before reusing SMEM for EARxBpEB store.
+      cutlass::arch::NamedBarrier::sync(
+          kNumEARxBpEBThreads + kNumBpEBStoreThreads,
+          static_cast<uint32_t>(NamedBarriers::EARxBpEBSMEMReady));
+    }
 
     store_EARxBpEB(params, tCrEARxBpEB, shared_storage, n_block, tid);
   }
@@ -868,7 +871,10 @@ class NoisingKernelB {
       cute::prefetch_tma_descriptor(params.tma_load_B.get_tma_descriptor());
       cute::prefetch_tma_descriptor(params.tma_load_EBR.get_tma_descriptor());
       cute::prefetch_tma_descriptor(params.tma_load_EBL.get_tma_descriptor());
-      cute::prefetch_tma_descriptor(params.tma_store_BpEB.get_tma_descriptor());
+      if constexpr (StoreBpEB) {
+        cute::prefetch_tma_descriptor(
+            params.tma_store_BpEB.get_tma_descriptor());
+      }
       cute::prefetch_tma_descriptor(params.tma_load_EAR.get_tma_descriptor());
       cute::prefetch_tma_descriptor(
           params.tma_store_EARxBpEB.get_tma_descriptor());
@@ -933,17 +939,19 @@ class NoisingKernelB {
     MainloopLoadPipeline pipeline_EBL(shared_storage.pipeline_EBL,
                                       pipeline_params_EBL, ClusterShape{});
 
-    // Store pipeline for BpEB
-    // Producer: WG2 (compute BpEB), Consumers: TMA store warp + WG1 (EARxBpEB)
+    // Store pipeline for BpEB.
+    // Producer: WG2 (compute BpEB tile in SMEM).
+    // Consumers: WG1 (EARxBpEB), plus the TMA store warp only when the caller
+    // wants the full BpEB tensor materialized in GMEM.
     StorePipelineParams pipeline_params_BpEB_store;
     pipeline_params_BpEB_store.role =
         warp_group_idx == 2 ? MainloopStorePipeline::ThreadCategory::Producer
-        : (warp_idx == 1 || warp_group_idx == 1)
+        : ((StoreBpEB && warp_idx == 1) || warp_group_idx == 1)
             ? MainloopStorePipeline::ThreadCategory::Consumer
             : MainloopStorePipeline::ThreadCategory::NonParticipant;
     pipeline_params_BpEB_store.producer_arv_count = kNumMmaThreads;  // one WG
     pipeline_params_BpEB_store.consumer_arv_count =
-        1 + kNumMmaThreads;  // one thread for TMA store + WG1
+        (StoreBpEB ? 1 : 0) + kNumMmaThreads;
     MainloopStorePipeline pipeline_BpEB_store(
         shared_storage.pipeline_BpEB_store, pipeline_params_BpEB_store);
 
@@ -965,12 +973,14 @@ class NoisingKernelB {
                      pipeline_B, pipeline_EAR, pipeline_EBL, smem_pipe_write_B,
                      smem_pipe_write_EAR, smem_pipe_write_EBL);
 
-      } else if (warp_idx_in_warpgroup == 1) {  // Store BpEB warp
-        store_BpEB(params, pipeline_BpEB_store, shared_storage, n_block,
-                   k_block_min, k_block_max);
-        cutlass::arch::NamedBarrier::arrive(
-            kNumEARxBpEBThreads + kNumBpEBStoreThreads,
-            static_cast<uint32_t>(NamedBarriers::EARxBpEBSMEMReady));
+      } else if constexpr (StoreBpEB) {
+        if (warp_idx_in_warpgroup == 1) {  // Store BpEB warp
+          store_BpEB(params, pipeline_BpEB_store, shared_storage, n_block,
+                     k_block_min, k_block_max);
+          cutlass::arch::NamedBarrier::arrive(
+              kNumEARxBpEBThreads + kNumBpEBStoreThreads,
+              static_cast<uint32_t>(NamedBarriers::EARxBpEBSMEMReady));
+        }
       }
     } else if (warp_group_idx == 1) {  // EARxBpEB consumer
       constexpr int ThreadOffset = kNumThreadsPerWarpGroup;

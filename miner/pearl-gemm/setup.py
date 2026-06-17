@@ -374,6 +374,7 @@ if not SKIP_CUDA_BUILD:
         "csrc/gemm/pearl_gemm_api.cpp",
         "csrc/gemm/noise_generation.cu",
         "csrc/gemm/denoise_converter.cu",
+        "csrc/gemm/bpeb_ear_product.cu",
         "csrc/gemm/inner_hash_kernel.cu",
         "csrc/gemm/quantize_kernel.cu",
         "csrc/blake3/blake3.cu",

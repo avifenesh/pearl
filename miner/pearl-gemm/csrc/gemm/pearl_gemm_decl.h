@@ -9,8 +9,11 @@ template <class ElementDenoise_AxEBL, int R, int bM_noising, int bK_noising,
           int kStages>
 void run_pearl_noising_A_(PearlAPIParams& params, cudaStream_t stream);
 template <class ElementDenoise_EARxBpEB, int R, int bN_noising, int bK_noising,
-          int kStages>
+          int kStages, bool StoreBpEB = true>
 void run_pearl_noising_B_(PearlAPIParams& params, cudaStream_t stream);
+template <class ElementDenoise_EARxBpEB, int R, int bN_noising, int bK_noising,
+          int kStages, bool UseReduction>
+void run_bpeb_ear_product_(PearlAPIParams& params, cudaStream_t stream);
 
 template <int R, int NumThreads>
 void run_noise_generation(Noise_gen_params& params, cudaStream_t stream);

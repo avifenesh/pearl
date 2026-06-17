@@ -234,6 +234,36 @@ def noise_B(
     )
 
 
+def noise_B_side_product(
+    B,  # n x k
+    EBR,  # n x r
+    EARxBpEB,  # n x r
+    EAR=None,  # r x k
+    EBL=None,  # k x r
+    tile_size_n: int | None = None,
+    tile_size_k: int | None = None,
+    pipeline_stages: int = 2,
+    k_blocks_per_split: int | None = None,
+):
+    """Generate only the B-side denoising component EARxBpEB.
+
+    This runs the same B-side noising math as noise_B but does not store the
+    full noised weight BpEB to global memory. It is intended for fusion
+    experiments and benchmarks; noisy_gemm still needs a BpEB operand today.
+    """
+    pearl_gemm_cuda.noise_B_side_product(
+        B,
+        EBR,
+        EARxBpEB,
+        EAR,
+        EBL,
+        tile_size_n,
+        tile_size_k,
+        pipeline_stages,
+        k_blocks_per_split,
+    )
+
+
 # Fake Tensor function for torch.compile support
 @torch.library.register_fake("pearl_gemm::noise_B")
 def _abstract_noise_b(
@@ -243,6 +273,61 @@ def _abstract_noise_b(
     BpEB,
     EAR,
     EBL,
+    tile_size_n=None,
+    tile_size_k=None,
+    pipeline_stages=2,
+    k_blocks_per_split=None,
+):
+    return None
+
+
+@torch.library.register_fake("pearl_gemm::noise_B_side_product")
+def _abstract_noise_b_side_product(
+    B,
+    EBR,
+    EARxBpEB,
+    EAR,
+    EBL,
+    tile_size_n=None,
+    tile_size_k=None,
+    pipeline_stages=2,
+    k_blocks_per_split=None,
+):
+    return None
+
+
+def bpeb_ear_product(
+    BpEB,  # n x k
+    EAR,  # r x k
+    EARxBpEB,  # n x r, int32
+    tile_size_n: int | None = None,
+    tile_size_k: int | None = None,
+    pipeline_stages: int = 2,
+    k_blocks_per_split: int | None = None,
+):
+    """Compute the denoising side-product for a cached noised weight.
+
+    This computes EARxBpEB = BpEB @ EAR.T into an int32 output tensor, matching
+    the int32 side-product produced by noise_B without re-forming BpEB.
+    Currently supports the compiled noising-B tile (64x64), pipeline_stages=2,
+    and R in {64, 128}.
+    """
+    pearl_gemm_cuda.bpeb_ear_product(
+        BpEB,
+        EAR,
+        EARxBpEB,
+        tile_size_n,
+        tile_size_k,
+        pipeline_stages,
+        k_blocks_per_split,
+    )
+
+
+@torch.library.register_fake("pearl_gemm::bpeb_ear_product")
+def _abstract_bpeb_ear_product(
+    BpEB,
+    EAR,
+    EARxBpEB,
     tile_size_n=None,
     tile_size_k=None,
     pipeline_stages=2,

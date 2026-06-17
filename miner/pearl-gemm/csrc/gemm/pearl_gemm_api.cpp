@@ -10,6 +10,7 @@
 #include <cutlass/numeric_types.h>
 
 #include <cute/container/array.hpp>
+#include "error_check.hpp"
 #include "heuristics.hpp"
 #include "host_signal_header.hpp"
 #include "inner_hash_kernel.h"
@@ -398,16 +399,17 @@ void noise_A(at::Tensor& A,                          // m x k
               c10::toString(AxEBL.scalar_type()));
 }
 
-void noise_B(at::Tensor& B,                          // n x k
-             at::Tensor& EBR,                        // n x r
-             at::Tensor& EARxBpEB,                   // n x r
-             at::Tensor& BpEB,                       // n x k
-             const std::optional<at::Tensor>& EAR_,  // k x r
-             const std::optional<at::Tensor>& EBL_,  // r x k
-             std::optional<int64_t> tile_size_n_ = std::nullopt,
-             std::optional<int64_t> tile_size_k_ = std::nullopt,
-             int64_t pipeline_stages = 2,
-             std::optional<int64_t> k_blocks_per_split_ = std::nullopt) {
+void noise_B_impl(at::Tensor& B,                          // n x k
+                  at::Tensor& EBR,                        // n x r
+                  at::Tensor& EARxBpEB,                   // n x r
+                  at::Tensor* BpEB,                       // n x k
+                  const std::optional<at::Tensor>& EAR_,  // k x r
+                  const std::optional<at::Tensor>& EBL_,  // r x k
+                  std::optional<int64_t> tile_size_n_,
+                  std::optional<int64_t> tile_size_k_,
+                  int64_t pipeline_stages,
+                  std::optional<int64_t> k_blocks_per_split_,
+                  bool store_bpeb) {
 
   at::cuda::CUDAGuard device_guard{(char)B.get_device()};
   auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -436,7 +438,11 @@ void noise_B(at::Tensor& B,                          // n x k
 
   check_tensor(B, n, k, torch::kInt8);
   check_tensor(EBR, n, r, torch::kInt8);
-  check_tensor(BpEB, n, k, torch::kInt8);
+  TORCH_CHECK(!store_bpeb || BpEB != nullptr,
+              "BpEB output is required when store_bpeb is true");
+  if (store_bpeb) {
+    check_tensor(*BpEB, n, k, torch::kInt8);
+  }
   check_tensor(EARxBpEB, n, r, torch::kFloat16, torch::kInt32);
 
   const int64_t tile_size_n = tile_size_n_.value_or(kDefaultNoisingTileSizeMN);
@@ -471,7 +477,7 @@ void noise_B(at::Tensor& B,                          // n x k
   params.ptr_AxEBL = nullptr;
   params.ptr_EARxBpEB = EARxBpEB.data_ptr();
   params.ptr_ApEA = nullptr;
-  params.ptr_BpEB = BpEB.data_ptr();
+  params.ptr_BpEB = store_bpeb ? BpEB->data_ptr() : nullptr;
   params.ptr_A_scales = nullptr;
   params.ptr_B_scales = nullptr;
   params.ptr_C = nullptr;
@@ -491,13 +497,155 @@ void noise_B(at::Tensor& B,                          // n x k
       tile_size_n, tile_size_k, r, pipeline_stages, EARxBpEB.scalar_type(),
 
       kernel_found = true;
-      run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_, stages_>(
-          params, stream););
+      if (store_bpeb) {
+        run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_, stages_,
+                             true>(params, stream);
+      } else {
+        run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_, stages_,
+                             false>(params, stream);
+      });
 
   TORCH_CHECK(kernel_found,
               "No noise_B kernel found with given config: ", "R = ", r,
               ", bN_noising = ", tile_size_n, ", EARxBpEB of type ",
               c10::toString(EARxBpEB.scalar_type()));
+}
+
+void noise_B(at::Tensor& B,                          // n x k
+             at::Tensor& EBR,                        // n x r
+             at::Tensor& EARxBpEB,                   // n x r
+             at::Tensor& BpEB,                       // n x k
+             const std::optional<at::Tensor>& EAR_,  // k x r
+             const std::optional<at::Tensor>& EBL_,  // r x k
+             std::optional<int64_t> tile_size_n_ = std::nullopt,
+             std::optional<int64_t> tile_size_k_ = std::nullopt,
+             int64_t pipeline_stages = 2,
+             std::optional<int64_t> k_blocks_per_split_ = std::nullopt) {
+  noise_B_impl(B, EBR, EARxBpEB, &BpEB, EAR_, EBL_, tile_size_n_,
+               tile_size_k_, pipeline_stages, k_blocks_per_split_,
+               /*store_bpeb=*/true);
+}
+
+void noise_B_side_product(
+    at::Tensor& B,                          // n x k
+    at::Tensor& EBR,                        // n x r
+    at::Tensor& EARxBpEB,                   // n x r
+    const std::optional<at::Tensor>& EAR_,  // k x r
+    const std::optional<at::Tensor>& EBL_,  // r x k
+    std::optional<int64_t> tile_size_n_ = std::nullopt,
+    std::optional<int64_t> tile_size_k_ = std::nullopt,
+    int64_t pipeline_stages = 2,
+    std::optional<int64_t> k_blocks_per_split_ = std::nullopt) {
+  noise_B_impl(B, EBR, EARxBpEB, nullptr, EAR_, EBL_, tile_size_n_,
+               tile_size_k_, pipeline_stages, k_blocks_per_split_,
+               /*store_bpeb=*/false);
+}
+
+void bpeb_ear_product(
+    at::Tensor& BpEB,                       // n x k
+    at::Tensor& EAR,                        // r x k
+    at::Tensor& EARxBpEB,                   // n x r, int32
+    std::optional<int64_t> tile_size_n_ = std::nullopt,
+    std::optional<int64_t> tile_size_k_ = std::nullopt,
+    int64_t pipeline_stages = 2,
+    std::optional<int64_t> k_blocks_per_split_ = std::nullopt) {
+  at::cuda::CUDAGuard device_guard{(char)BpEB.get_device()};
+  auto dprops = at::cuda::getCurrentDeviceProperties();
+
+  int n = int(BpEB.size(0));
+  int k = int(BpEB.size(1));
+  int r = int(EAR.size(0));
+  TORCH_CHECK(
+      k % 16 == 0,
+      "K must be divisible by 16 (the size of a 128b vectorized copy atom)");
+
+  check_tensor(BpEB, n, k, torch::kInt8);
+  check_tensor(EAR, r, k, torch::kInt8);
+  check_tensor(EARxBpEB, n, r, torch::kInt32);
+
+  const int64_t tile_size_n = tile_size_n_.value_or(kDefaultNoisingTileSizeMN);
+  const int64_t tile_size_k = tile_size_k_.value_or(kDefaultNoisingTileSizeK);
+  TORCH_CHECK(r == 64 || r == 128,
+              "bpeb_ear_product supports R=64 or R=128, got ", r);
+  TORCH_CHECK(tile_size_n == kDefaultNoisingTileSizeMN,
+              "bpeb_ear_product supports tile_size_n=",
+              kDefaultNoisingTileSizeMN, ", got ", tile_size_n);
+  TORCH_CHECK(tile_size_k == kDefaultNoisingTileSizeK,
+              "bpeb_ear_product supports tile_size_k=", kDefaultNoisingTileSizeK,
+              ", got ", tile_size_k);
+  TORCH_CHECK(pipeline_stages == 2,
+              "bpeb_ear_product supports pipeline_stages=2, got ",
+              pipeline_stages);
+  if (k_blocks_per_split_.has_value()) {
+    TORCH_CHECK(k_blocks_per_split_.value() >= 0,
+                "k_blocks_per_split must be non-negative, got ",
+                k_blocks_per_split_.value());
+  }
+
+  int total_k_blocks = (k + int(tile_size_k) - 1) / int(tile_size_k);
+  int k_blocks_per_split;
+  if (k_blocks_per_split_.has_value()) {
+    k_blocks_per_split = int(k_blocks_per_split_.value());
+  } else {
+    k_blocks_per_split =
+        get_num_k_blocks(n, tile_size_n, k, tile_size_k, dprops);
+  }
+
+  bool use_reduction =
+      k_blocks_per_split > 0 && k_blocks_per_split < total_k_blocks;
+
+  PearlAPIParams params{};
+  params.m = 1;
+  params.n = n;
+  params.k = k;
+  params.r = r;
+
+  params.ptr_A = nullptr;
+  params.ptr_B = nullptr;
+  params.ptr_EAL = nullptr;
+  params.ptr_EAR_K_major = EAR.data_ptr();
+  params.ptr_EBL_R_major = nullptr;
+  params.ptr_EAR_R_major = nullptr;
+  params.ptr_EBL_K_major = nullptr;
+  params.ptr_EBR = nullptr;
+  params.ptr_AxEBL = nullptr;
+  params.ptr_EARxBpEB = EARxBpEB.data_ptr();
+  params.ptr_ApEA = nullptr;
+  params.ptr_BpEB = BpEB.data_ptr();
+  params.ptr_A_scales = nullptr;
+  params.ptr_B_scales = nullptr;
+  params.ptr_C = nullptr;
+  params.host_signal_header_pinned = nullptr;
+  params.host_signal_sync = nullptr;
+
+  params.k_blocks_per_split_noising_A = 0;
+  params.k_blocks_per_split_noising_B =
+      use_reduction ? k_blocks_per_split : total_k_blocks;
+  params.inner_hash_counter = nullptr;
+  params.ptr_pow_target = nullptr;
+  params.ptr_pow_key = nullptr;
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  if (use_reduction) {
+    gpuErrchk(cudaMemsetAsync(EARxBpEB.data_ptr(), 0,
+                              EARxBpEB.numel() * EARxBpEB.element_size(),
+                              stream));
+  }
+
+  if (r == 64) {
+    if (use_reduction) {
+      run_bpeb_ear_product_<int, 64, 64, 64, 2, true>(params, stream);
+    } else {
+      run_bpeb_ear_product_<int, 64, 64, 64, 2, false>(params, stream);
+    }
+  } else {
+    if (use_reduction) {
+      run_bpeb_ear_product_<int, 128, 64, 64, 2, true>(params, stream);
+    } else {
+      run_bpeb_ear_product_<int, 128, 64, 64, 2, false>(params, stream);
+    }
+  }
 }
 
 void gemm(at::Tensor& A,         // m x k
@@ -1057,6 +1205,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm", &gemm, "GEMM without noising steps");
   m.def("noise_A", &noise_A, "Noise A (activations)");
   m.def("noise_B", &noise_B, "Noise B (weights)");
+  m.def("noise_B_side_product", &noise_B_side_product,
+        "Compute B-side denoising product without storing BpEB");
+  m.def("bpeb_ear_product", &bpeb_ear_product,
+        "Compute EARxBpEB from cached BpEB and EAR");
   m.def("get_host_signal_header", &get_host_signal_header,
         "Get host signal header");
   m.def("noise_gen", &noise_gen, "Noise generation");
@@ -1251,6 +1403,32 @@ TORCH_LIBRARY(pearl_gemm, m) {
       {at::Tag::pt2_compliant_tag});
 
   m.def(
+      "noise_B_side_product("
+      "    Tensor B, "
+      "    Tensor EBR, "
+      "    Tensor(EARxBpEB!) EARxBpEB, "
+      "    Tensor? EAR, "
+      "    Tensor? EBL, "
+      "    int? tile_size_n = None, "
+      "    int? tile_size_k = None, "
+      "    int pipeline_stages = 2, "
+      "    int? k_blocks_per_split = None"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+
+  m.def(
+      "bpeb_ear_product("
+      "    Tensor BpEB, "
+      "    Tensor EAR, "
+      "    Tensor(EARxBpEB!) EARxBpEB, "
+      "    int? tile_size_n = None, "
+      "    int? tile_size_k = None, "
+      "    int pipeline_stages = 2, "
+      "    int? k_blocks_per_split = None"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+
+  m.def(
       "denoise_converter("
       "     Tensor? EARxBpEB_in,"
       "     Tensor? AxEBL_in,"
@@ -1313,6 +1491,8 @@ TORCH_LIBRARY_IMPL(pearl_gemm, CUDA, m) {
   m.impl("gemm", &gemm);
   m.impl("noise_A", &noise_A);
   m.impl("noise_B", &noise_B);
+  m.impl("noise_B_side_product", &noise_B_side_product);
+  m.impl("bpeb_ear_product", &bpeb_ear_product);
   m.impl("denoise_converter", &denoise_converter);
   m.impl("noise_gen", &noise_gen);
   m.impl("quantize", &quantize);
