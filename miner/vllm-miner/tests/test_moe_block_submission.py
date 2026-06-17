@@ -7,7 +7,9 @@ from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
 from miner_base.settings import MinerSettings
 from miner_utils import get_logger
 from moe_testing_helpers import make_moe_tensors
+from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_gateway.comm.mining_configuration import MoEConfig
+from pearl_mining import IncompleteBlockHeader
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -37,7 +39,24 @@ _HIDDEN_SIZE = 2048
 _INTERMEDIATE_SIZE = 1024
 _NUM_TOKENS = 2048
 _TOP_K = 2
-_EASY_TARGET = 2**242
+_EASY_NBITS = 0x207FFFFF
+_EASY_TARGET = 2**256 - 1
+
+
+def _with_header_nbits(mining_job: MiningJob, nbits: int) -> MiningJob:
+    header = IncompleteBlockHeader.from_bytes(mining_job.incomplete_header_bytes)
+    easy_header = IncompleteBlockHeader(
+        header.version,
+        header.prev_block,
+        header.merkle_root,
+        header.timestamp,
+        nbits,
+    )
+    return MiningJob(
+        incomplete_header_bytes=easy_header.to_bytes(),
+        target=mining_job.target,
+        cert_version=mining_job.cert_version,
+    )
 
 
 @pytest.fixture
@@ -116,22 +135,44 @@ def test_block_found_and_proof_verifies(pearl_moe_layer, get_mining_job, async_m
     matmul_config = GPUMatmulConfigFactory.create(
         k=k, noise_rank=noise_rank, moe=MoEConfig(e=_NUM_EXPERTS, top_k=_TOP_K)
     )
-    mining_job = get_mining_job(mining_config=matmul_config.mining_config, target=_EASY_TARGET)
+    mining_job = _with_header_nbits(
+        get_mining_job(mining_config=matmul_config.mining_config, target=_EASY_TARGET),
+        _EASY_NBITS,
+    )
 
     with patch.object(am, "_client") as mock_mining_client:
         mock_mining_client.get_mining_info.return_value = mining_job
         am._mining_job = am._client.get_mining_info()
 
-        moe_method.apply(
-            layer,
-            tensors.hidden_states,
-            tensors.topk_weights,
-            tensors.topk_ids,
-            None,
-        )
+        hot_experts = torch.arange(_TOP_K, dtype=torch.int32, device="cuda").expand(_NUM_TOKENS, -1)
+        tensors.topk_ids.copy_(hot_experts)
 
-        am.wait_until_done_submitting_blocks()
-        assert am.blocks_submitted == 1
+        start_time = time.time()
+        forward_count = 0
+        while am.blocks_submitted == 0:
+            if time.time() - start_time > _MINING_LOOP_TIMEOUT_SECONDS:
+                pytest.fail(
+                    f"Timeout ({_MINING_LOOP_TIMEOUT_SECONDS}s) waiting for block. "
+                    f"Performed {forward_count} forwards, "
+                    f"blocks_submitted={am.blocks_submitted}"
+                )
+
+            hidden_states = (
+                tensors.hidden_states
+                if forward_count == 0
+                else torch.randn_like(tensors.hidden_states)
+            )
+            moe_method.apply(
+                layer,
+                hidden_states,
+                tensors.topk_weights,
+                tensors.topk_ids,
+                None,
+            )
+            forward_count += 1
+            am.wait_until_done_submitting_blocks()
+
+        assert am.blocks_submitted >= 1
 
 
 @pytest.fixture

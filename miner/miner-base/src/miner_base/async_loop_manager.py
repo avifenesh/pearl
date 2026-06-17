@@ -233,6 +233,10 @@ class AsyncLoopManager:
             while not item.cuda_event.query():
                 await asyncio.sleep(0.01)
 
+            # Ensure host-pinned writes performed before the event are visible to
+            # the CPU thread before the callback reads the signal header.
+            item.cuda_event.synchronize()
+
             # callback should be fast (setup and call `handle_submit_block`)
             try:
                 item.callback(self.handle_submit_block)
