@@ -32,7 +32,7 @@ from .moe_gemm_operators import (
     permute_a_side_to_expert_order,
     prepare_moe_noising,
 )
-from .pearl_moe_method import W2_BLOCK_SHAPE, W13_SMOOTH_SHARED_EXPERT_INDEX
+from .pearl_moe_method import W2_BLOCK_SHAPE
 from .quantization_operators import quant_7bit, quant_fp8_block
 
 _GEMM2_TOP_K = 1
@@ -151,7 +151,7 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
     def _quant_a_7bit(self, hidden_states: torch.Tensor, K: int):
         """Quantize activations with the shared gate/up smooth scale when present."""
         w13_smooth = self._get_smooth_scale("w13_smooth_quant_scale")
-        smooth = w13_smooth[W13_SMOOTH_SHARED_EXPERT_INDEX, :K] if w13_smooth is not None else None
+        smooth = w13_smooth[:K] if w13_smooth is not None else None
         return quant_7bit(hidden_states, smooth_scale=smooth)
 
     def apply(
