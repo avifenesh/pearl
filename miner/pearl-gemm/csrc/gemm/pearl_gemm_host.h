@@ -65,16 +65,29 @@ void run_pearl_gemm(PearlAPIParams const& params, cudaStream_t stream = 0) {
   int swizzle_divisor =
       params.swizzle_n_maj ? size<1>(ClusterShape{}) : size<0>(ClusterShape{});
   int swizzle = cutlass::ceil_div(params.swizzle, swizzle_divisor);
+  bool const do_fuse_noise_b =
+      pearl::kFuseNoiseB && params.ptr_EBL_R_major != nullptr &&
+      params.ptr_EBR != nullptr;
   typename CollectiveMainloop::Arguments mainloop_args{
+      // B' fusion: when enabled and noise factors are present, feed the GEMM raw
+      // weights B + skinny noise factors EBL/EBR, and form BpEB on-chip. If the
+      // noise factors are absent, fall back to the pre-noised BpEB operand so a
+      // fused build never silently computes against raw, un-noised B.
       .ptr_A = static_cast<ElementIn*>(params.ptr_ApEA),
-      .ptr_B = static_cast<ElementIn*>(params.ptr_BpEB),
+      .ptr_B = do_fuse_noise_b ? static_cast<ElementIn*>(params.ptr_B)
+                               : static_cast<ElementIn*>(params.ptr_BpEB),
       .host_signal_header_pinned =
           static_cast<HostSignalHeader*>(params.host_signal_header_pinned),
       .host_signal_sync = static_cast<HostSignalSync*>(params.host_signal_sync),
       .problem_shape = problem_shape,
       .inner_hash_counter = params.inner_hash_counter,
       .ptr_pow_target = static_cast<uint32_t const*>(params.ptr_pow_target),
-      .ptr_pow_key = static_cast<uint32_t const*>(params.ptr_pow_key)};
+      .ptr_pow_key = static_cast<uint32_t const*>(params.ptr_pow_key),
+      .ptr_EBL_R_major = do_fuse_noise_b
+                             ? static_cast<ElementIn const*>(params.ptr_EBL_R_major)
+                             : nullptr,
+      .ptr_EBR = do_fuse_noise_b ? static_cast<ElementIn const*>(params.ptr_EBR)
+                                 : nullptr};
   typename CollectiveMainloop::Params mainloop_params =
       CollectiveMainloop::to_underlying_arguments(mainloop_args);
 

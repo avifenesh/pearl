@@ -891,6 +891,11 @@ void noisy_gemm(
                     tile_size_n_noising_B, tile_size_k_noising_B, r,
                     pipeline_stages_noising_B, EARxBpEB_noising_dtype,
                     kernel_found_noising_b = true;
+                    // B' fusion keeps noising_B for EARxBpEB denoising, but the
+                    // fused GEMM reads raw B and re-forms BpEB on-chip. In a
+                    // fused build, the HBM BpEB materialized here is ignored by
+                    // the main GEMM; keeping the launch preserves denoising
+                    // correctness while removing the BpEB read from the GEMM path.
                     run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_,
                                          stages_>(params, stream););
               } else { kernel_found_noising_b = true; }

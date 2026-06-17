@@ -1,10 +1,10 @@
 import math
 import os
+import sys
+from pathlib import Path
 
 import pytest
 import torch
-from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
-from miner_base.matmul_config import MatmulConfig
 from pearl_gemm import (
     denoise_converter,
     gemm,
@@ -25,6 +25,31 @@ Rs = (
 )
 
 DISABLE_DEBUG_MODE = os.getenv("PEARL_GEMM_DISABLE_DEBUG_MODE", "FALSE") == "TRUE"
+
+
+def _read_fuse_noise_b_marker() -> bool | None:
+    for entry in sys.path:
+        marker_path = Path(entry) / "pearl_gemm" / "_build_marker.py"
+        if marker_path.exists():
+            namespace: dict[str, object] = {}
+            exec(marker_path.read_text(), namespace)  # noqa: S102 - trusted local build marker
+            return bool(namespace.get("FUSE_NOISE_B", False))
+    return None
+
+
+def _compiled_fuse_noise_b_enabled() -> bool:
+    marker = _read_fuse_noise_b_marker()
+    if marker is not None:
+        return marker
+    return os.getenv("PEARL_FUSE_NOISE_B", "FALSE").upper() in {
+        "1",
+        "TRUE",
+        "YES",
+        "ON",
+    }
+
+
+FUSE_NOISE_B = _compiled_fuse_noise_b_enabled()
 
 # Run tests against default compiled kernels
 from pearl_gemm_build_utils.kernel_configs.default_compiled_kernels import (  # noqa: E402
@@ -907,6 +932,56 @@ class TestNoisyGEMM(TestPearlGEMMBase):
         torch.testing.assert_close(tg.C.cpu(), C_ref.to(torch.bfloat16), atol=atol, rtol=rtol)
 
 
+class TestFusedNoiseB(TestPearlGEMMBase):
+    @pytest.mark.skipif(not FUSE_NOISE_B, reason="requires PEARL_FUSE_NOISE_B build")
+    @pytest.mark.parametrize("m,n,k", [(128, 1024, 1024), (512, 6144, 4096)])
+    @pytest.mark.parametrize("matmul_config", [k for k in matmul_kernels if k.R == 64])
+    def test_fused_noisy_gemm_reforms_bpeb_on_chip(self, m, n, k, matmul_config):
+        gemm_params = GEMMParam(
+            m,
+            n,
+            k,
+            matmul_config=matmul_config,
+            skip_noising_b=True,
+            skip_reduction=True,
+        )
+        tg = GemmTensorGenerator(gemm_params)
+        tg.generate()
+
+        # noising_B is deliberately skipped below. Precompute only EARxBpEB for
+        # denoising correctness, then poison materialized BpEB. A non-fused GEMM
+        # would read this bad BpEB and fail; a fused build should ignore it and
+        # re-form BpEB on chip from raw B + EBR/EBL.
+        earxbpeb_ref, _ = self.compute_ref_noise_B(tg, gemm_params, return_cpu=False)
+        tg.EARxBpEB.copy_(earxbpeb_ref)
+        tg.BpEB.zero_()
+
+        self.run_noisy_gemm(tg, gemm_params)
+
+        c_ref = self.compute_ref_tensor(tg)
+        torch.testing.assert_close(tg.C.cpu(), c_ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+    @pytest.mark.skipif(not FUSE_NOISE_B, reason="requires PEARL_FUSE_NOISE_B build")
+    @pytest.mark.parametrize("m,n,k", [(128, 1024, 1024), (512, 6144, 4096)])
+    @pytest.mark.parametrize("matmul_config", [k for k in matmul_kernels if k.R == 64])
+    def test_fused_noisy_gemm_production_path(self, m, n, k, matmul_config):
+        gemm_params = GEMMParam(
+            m,
+            n,
+            k,
+            matmul_config=matmul_config,
+            skip_noising_b=False,
+            skip_reduction=True,
+        )
+        tg = GemmTensorGenerator(gemm_params)
+        tg.generate()
+
+        self.run_noisy_gemm(tg, gemm_params)
+
+        c_ref = self.compute_ref_tensor(tg)
+        torch.testing.assert_close(tg.C.cpu(), c_ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
 class TestGEMM(TestPearlGEMMBase):
     @pytest.mark.parametrize("matmul_config", matmul_kernels)
     def test_gemm_opcheck(self, matmul_config):
@@ -1113,7 +1188,7 @@ class TestSkipReductionNoisyGEMM(TestPearlGEMMBase):
         torch.testing.assert_close(tg.C.cpu(), C_ref.to(torch.bfloat16), atol=atol, rtol=rtol)
 
 
-def calculate_expected_inner_hash_count(m: int, n: int, k: int, matmul_config: MatmulConfig) -> int:
+def calculate_expected_inner_hash_count(m: int, n: int, k: int, matmul_config) -> int:
     """
     Calculate total inner_hash calls during GEMM for validation.
 
@@ -1163,6 +1238,8 @@ class TestInnerHashCounting(TestPearlGEMMBase):
             matmul_config=matmul_kernel_config,
             skip_reduction=False,
         )
+
+        from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
 
         matmul_config = GPUMatmulConfigFactory.create(k=k, noise_rank=gemm_params.R)
 
