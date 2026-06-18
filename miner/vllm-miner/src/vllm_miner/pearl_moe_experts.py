@@ -44,6 +44,8 @@ _GEMM2_TOP_K = 1
 _MIN_COMPUTE_CAPABILITY_MAJOR = 9
 # vLLM sentinel meaning "infer expert count from the weight tensor".
 GLOBAL_NUM_EXPERTS_INFER_FROM_WEIGHTS = -1
+_EXPERT_LOCAL_MINING_ENV = "MINER_MOE_EXPERT_LOCAL_MINING"
+_EXPERT_LOCAL_MIN_M_ENV = "MINER_MOE_EXPERT_LOCAL_MIN_M"
 
 _SUPPORTED_ACTIVATIONS = frozenset(
     {
@@ -62,8 +64,30 @@ _TORCH_TO_TRITON_DTYPE: dict[torch.dtype, tl.dtype] = {
 
 
 def _use_expert_local_mining_threshold() -> bool:
-    value = os.getenv("MINER_MOE_EXPERT_LOCAL_MINING", "1").lower()
+    value = os.getenv(_EXPERT_LOCAL_MINING_ENV, "1").lower()
     return value not in {"0", "false", "no", "off"}
+
+
+def _expert_local_min_m() -> int:
+    gemm_config = pearl_config.matrix_multiplication_config["use_simplified_gemm"]
+    global_min_m = int(gemm_config["min_m"])
+    value = os.getenv(_EXPERT_LOCAL_MIN_M_ENV)
+    if value is None or value == "":
+        return global_min_m
+
+    try:
+        min_m = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{_EXPERT_LOCAL_MIN_M_ENV} must be an integer") from exc
+
+    if min_m < global_min_m:
+        raise ValueError(f"{_EXPERT_LOCAL_MIN_M_ENV} must be >= {global_min_m}")
+
+    tile_size_m = int(pearl_config.settings.tile_size_m)
+    if min_m % tile_size_m != 0:
+        raise ValueError(f"{_EXPERT_LOCAL_MIN_M_ENV} must be a multiple of {tile_size_m}")
+
+    return min_m
 
 
 def _torch_dtype_to_triton_compute_type(dtype: torch.dtype) -> tl.dtype:
@@ -167,10 +191,14 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _expert_mining_mask(layout: MoERoutingLayout, n: int, k: int) -> list[bool]:
-        return [
-            pearl_config.should_use_noisy_gemm(layout.expert_slice(expert_index)[1], n, k)
-            for expert_index in range(layout.num_experts)
-        ]
+        gemm_config = pearl_config.matrix_multiplication_config["use_simplified_gemm"]
+        min_n = int(gemm_config["min_n"])
+        min_k = int(gemm_config["min_k"])
+        if (n == 1) or (k == 1) or (n < min_n) or (k < min_k):
+            return [False] * layout.num_experts
+
+        min_m = _expert_local_min_m()
+        return [layout.expert_slice(i)[1] >= min_m for i in range(layout.num_experts)]
 
     def apply(
         self,
