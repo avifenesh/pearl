@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from compressed_tensors.quantization import QuantizationArgs
 from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
 from miner_base.settings import MinerSettings
 from miner_utils import get_logger
@@ -58,6 +59,23 @@ def _with_header_nbits(mining_job: MiningJob, nbits: int) -> MiningJob:
         cert_version=mining_job.cert_version,
     )
 
+_DOWN_WEIGHT_QUANT = QuantizationArgs(
+    num_bits=8,
+    type="float",
+    strategy="block",
+    block_structure=[128, 128],
+    symmetric=True,
+    dynamic=False,
+)
+_DOWN_INPUT_QUANT = QuantizationArgs(
+    num_bits=8,
+    type="float",
+    strategy="group",
+    group_size=128,
+    dynamic=True,
+    symmetric=True,
+)
+
 
 @pytest.fixture
 def async_manager():
@@ -86,7 +104,7 @@ def pearl_moe_layer():
         moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
         in_dtype=torch.bfloat16,
     )
-    moe_method = PearlMoEMethod(moe_config)
+    moe_method = PearlMoEMethod(moe_config, _DOWN_WEIGHT_QUANT, _DOWN_INPUT_QUANT)
 
     layer = torch.nn.Module()
     moe_method.create_weights(
