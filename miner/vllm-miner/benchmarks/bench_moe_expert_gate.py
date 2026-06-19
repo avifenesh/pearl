@@ -240,15 +240,23 @@ def _run_mode(
             ]
             avg_ms = statistics.mean(samples)
             total_slots = sum(counts)
+            if no_mining:
+                mined_slots = 0
+            elif expert_local_env == "0":
+                mined_slots = sum(count for count in counts if count > 0)
+            else:
+                mined_slots = sum(count for count in counts if count >= args.min_m)
             rows.append(
                 {
                     "mode": mode,
                     "case": case_name,
                     "qualifying": sum(count >= args.min_m for count in counts),
                     "slots": total_slots,
+                    "mined_slots": mined_slots,
                     "tokens": total_slots // args.top_k,
                     "avg_ms": avg_ms,
                     "slots_per_s": total_slots / (avg_ms / 1000.0),
+                    "mined_slots_per_s": mined_slots / (avg_ms / 1000.0),
                 }
             )
     return rows
@@ -256,13 +264,15 @@ def _run_mode(
 
 def _print_rows(rows: list[dict[str, float | int | str]]) -> None:
     print(
-        "mode,case,qualifying_experts,routed_slots,tokens,avg_ms,slots_per_s",
+        "mode,case,qualifying_experts,routed_slots,mined_slots,tokens,"
+        "avg_ms,slots_per_s,mined_slots_per_s",
         flush=True,
     )
     for row in rows:
         print(
             f"{row['mode']},{row['case']},{row['qualifying']},{row['slots']},"
-            f"{row['tokens']},{row['avg_ms']:.3f},{row['slots_per_s']:.1f}",
+            f"{row['mined_slots']},{row['tokens']},{row['avg_ms']:.3f},"
+            f"{row['slots_per_s']:.1f},{row['mined_slots_per_s']:.1f}",
             flush=True,
         )
 
