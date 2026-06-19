@@ -602,6 +602,22 @@ def commitment_hash_from_merkle_roots(
     )
 
 
+def commitment_hash_from_b_commitment(
+    A_merkle_root,
+    B_commitment_hash,
+    A_commitment_hash,
+    routing_root=None,
+    offsets_hash=None,
+):
+    return pearl_gemm_cuda.commitment_hash_from_b_commitment(
+        A_merkle_root,
+        B_commitment_hash,
+        A_commitment_hash,
+        routing_root,
+        offsets_hash,
+    )
+
+
 @torch.library.register_fake("pearl_gemm::commitment_hash_from_merkle_roots")
 def _abstract_commitment_hash_from_merkle_roots(
     A_merkle_root,
@@ -609,6 +625,17 @@ def _abstract_commitment_hash_from_merkle_roots(
     key,
     A_commitment_hash,
     B_commitment_hash,
+    routing_root=None,
+    offsets_hash=None,
+):
+    return None
+
+
+@torch.library.register_fake("pearl_gemm::commitment_hash_from_b_commitment")
+def _abstract_commitment_hash_from_b_commitment(
+    A_merkle_root,
+    B_commitment_hash,
+    A_commitment_hash,
     routing_root=None,
     offsets_hash=None,
 ):

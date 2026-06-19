@@ -3,7 +3,12 @@ import torch
 from blake3 import blake3
 from miner_base.commitment_hash import CommitmentHasher
 from miner_base.matrix_merkle_tree import MatrixMerkleTree
-from pearl_gemm import commitment_hash_from_merkle_roots, get_required_scratchpad_bytes, tensor_hash
+from pearl_gemm import (
+    commitment_hash_from_b_commitment,
+    commitment_hash_from_merkle_roots,
+    get_required_scratchpad_bytes,
+    tensor_hash,
+)
 
 
 def hash_matrix(matrix: torch.Tensor, key: bytes) -> torch.Tensor:
@@ -193,6 +198,26 @@ class TestTensorHash:
         assert cuda_result_B.cpu().numpy().tobytes() == reference.noise_seed_B, (
             "MoE commitment hash mismatch: CUDA result doesn't match Python reference"
         )
+
+    def test_commitment_hash_from_b_commitment_matches_full_commitment(self):
+        """Warm-path A commitment matches the full A/B root commitment kernel."""
+        A_merkle_root = torch.randint(
+            0, 255, (blake3.digest_size,), dtype=torch.uint8, device="cuda"
+        )
+        B_merkle_root = torch.randint(
+            0, 255, (blake3.digest_size,), dtype=torch.uint8, device="cuda"
+        )
+        key = torch.randint(0, 255, (blake3.digest_size,), dtype=torch.uint8, device="cuda")
+
+        full_A = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
+        full_B = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
+        commitment_hash_from_merkle_roots(A_merkle_root, B_merkle_root, key, full_A, full_B)
+
+        warm_A = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
+        commitment_hash_from_b_commitment(A_merkle_root, full_B, warm_A)
+        torch.cuda.synchronize()
+
+        assert torch.equal(warm_A, full_A)
 
     @pytest.mark.parametrize(
         "shape",

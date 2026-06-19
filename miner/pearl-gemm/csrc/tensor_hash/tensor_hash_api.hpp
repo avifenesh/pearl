@@ -196,5 +196,67 @@ void run_commitment_hash_from_merkle_roots(
       *dprops, stream);
 }
 
+void run_commitment_hash_from_b_commitment(
+    at::Tensor& A_merkle_root, at::Tensor& B_commitment_hash,
+    at::Tensor& A_commitment_hash,
+    std::optional<at::Tensor> routing_root = std::nullopt,
+    std::optional<at::Tensor> offsets_hash = std::nullopt) {
+  CHECK_DEVICE(A_merkle_root);
+  CHECK_DEVICE(B_commitment_hash);
+  CHECK_DEVICE(A_commitment_hash);
+  CHECK_CONTIGUOUS(A_merkle_root);
+  CHECK_CONTIGUOUS(B_commitment_hash);
+  CHECK_CONTIGUOUS(A_commitment_hash);
+
+  TORCH_CHECK(A_merkle_root.dtype() == at::kByte,
+              "A_merkle_root must be uint8");
+  TORCH_CHECK(B_commitment_hash.dtype() == at::kByte,
+              "B_commitment_hash must be uint8");
+  TORCH_CHECK(A_commitment_hash.dtype() == at::kByte,
+              "A_commitment_hash must be uint8");
+  TORCH_CHECK(A_merkle_root.numel() == blake3::CHAINING_VALUE_SIZE,
+              "A_merkle_root must have exactly", blake3::CHAINING_VALUE_SIZE,
+              "bytes");
+  TORCH_CHECK(B_commitment_hash.numel() == blake3::CHAINING_VALUE_SIZE,
+              "B_commitment_hash must have exactly",
+              blake3::CHAINING_VALUE_SIZE, "bytes");
+  TORCH_CHECK(A_commitment_hash.numel() == blake3::CHAINING_VALUE_SIZE,
+              "A_commitment_hash must have exactly",
+              blake3::CHAINING_VALUE_SIZE, "bytes");
+  TORCH_CHECK(routing_root.has_value() == offsets_hash.has_value(),
+              "routing_root and offsets_hash must be provided together");
+
+  const uint8_t* routing_root_ptr = nullptr;
+  const uint8_t* offsets_hash_ptr = nullptr;
+  if (routing_root.has_value()) {
+    auto& routing_root_tensor = routing_root.value();
+    auto& offsets_hash_tensor = offsets_hash.value();
+    CHECK_DEVICE(routing_root_tensor);
+    CHECK_DEVICE(offsets_hash_tensor);
+    CHECK_CONTIGUOUS(routing_root_tensor);
+    CHECK_CONTIGUOUS(offsets_hash_tensor);
+    TORCH_CHECK(routing_root_tensor.dtype() == at::kByte,
+                "routing_root must be uint8");
+    TORCH_CHECK(offsets_hash_tensor.dtype() == at::kByte,
+                "offsets_hash must be uint8");
+    TORCH_CHECK(routing_root_tensor.numel() == blake3::CHAINING_VALUE_SIZE,
+                "routing_root must have exactly", blake3::CHAINING_VALUE_SIZE,
+                "bytes");
+    TORCH_CHECK(offsets_hash_tensor.numel() == blake3::CHAINING_VALUE_SIZE,
+                "offsets_hash must have exactly", blake3::CHAINING_VALUE_SIZE,
+                "bytes");
+    routing_root_ptr = routing_root_tensor.data_ptr<uint8_t>();
+    offsets_hash_ptr = offsets_hash_tensor.data_ptr<uint8_t>();
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto dprops = at::cuda::getCurrentDeviceProperties();
+
+  commitment_hash_from_b_commitment(
+      A_merkle_root.data_ptr<uint8_t>(), B_commitment_hash.data_ptr<uint8_t>(),
+      A_commitment_hash.data_ptr<uint8_t>(), routing_root_ptr, offsets_hash_ptr,
+      *dprops, stream);
+}
+
 #undef CHECK_DEVICE
 #undef CHECK_CONTIGUOUS
