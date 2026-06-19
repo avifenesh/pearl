@@ -202,6 +202,16 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         min_m = _expert_local_min_m()
         return [layout.expert_slice(i)[1] >= min_m for i in range(layout.num_experts)]
 
+    @staticmethod
+    def _active_expert_mask(layout: MoERoutingLayout) -> list[bool]:
+        return [layout.expert_slice(i)[1] > 0 for i in range(layout.num_experts)]
+
+    @classmethod
+    def _forward_mining_mask(cls, layout: MoERoutingLayout, n: int, k: int) -> list[bool]:
+        if _use_expert_local_mining_threshold():
+            return cls._expert_mining_mask(layout, n, k)
+        return cls._active_expert_mask(layout)
+
     def apply(
         self,
         output: torch.Tensor,
@@ -253,10 +263,7 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         should_mine = False
         if should_try_mining:
             routing_layout = build_moe_routing_layout(topk_ids, E)
-            if _use_expert_local_mining_threshold():
-                mine_expert_mask = self._expert_mining_mask(routing_layout, N, K)
-            else:
-                mine_expert_mask = [True] * E
+            mine_expert_mask = self._forward_mining_mask(routing_layout, N, K)
             should_mine = any(mine_expert_mask)
 
         if should_mine:
@@ -362,7 +369,7 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         )
 
         submit = not get_async_manager()._conf.skip_block_submission
-        pow_headers = [get_pinned_pool().acquire() for _ in range(E)]
+        pow_headers: list[tuple[int, torch.Tensor]] = []
 
         tile_m = pearl_config.settings.tile_size_m
         tile_n = pearl_config.settings.tile_size_n
@@ -381,6 +388,8 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
                 B_scales_e = self.w1_scale[expert_index]
 
                 if mine_expert_mask[expert_index]:
+                    pow_header = get_pinned_pool().acquire()
+                    pow_headers.append((expert_index, pow_header))
                     expert_output = gemm1_output_by_slot[:expert_slot_count]
                     pearl_moe_expert_gemm(
                         A_q_e=A_q_e,
@@ -398,7 +407,7 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
                         EAR_K_major=ctx.EAR_K_major,
                         EBL_K_major=ctx.EBL_K_major,
                         C_e=expert_output,
-                        host_signal_header_pinned=pow_headers[expert_index],
+                        host_signal_header_pinned=pow_header,
                         host_signal_sync=host_signal_sync,
                         pow_target=ctx.pow_target,
                         pow_key=ctx.pow_key,
@@ -423,12 +432,12 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
                     expert_output = expert_output * expert_weights.unsqueeze(-1)
                 cache_flat[expert_slot_indices] = expert_output
         except Exception:
-            for header_tensor in pow_headers:
+            for _, header_tensor in pow_headers:
                 get_pinned_pool().release(header_tensor)
             raise
 
         if not submit:
-            for header_tensor in pow_headers:
+            for _, header_tensor in pow_headers:
                 get_pinned_pool().release(header_tensor)
             return
 
