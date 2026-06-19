@@ -15,7 +15,7 @@ import torch
 from miner_base.settings import MinerSettings
 from pearl_gateway.comm.dataclasses import MiningJob
 from vllm_miner.config import config
-from vllm_miner.gemm_operators import pearl_gemm_noisy
+from vllm_miner.gemm_operators import pearl_gemm_noisy, pearl_gemm_vanilla
 from vllm_miner.mining_state import (
     delete_state,
     get_async_manager,
@@ -33,7 +33,7 @@ from vllm_miner.prepared_b_mining_state import (
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark dense noisy GEMM with disabled, cold, warm, and job-transition PreparedBMiningState."
+        description="Benchmark dense GEMM with vanilla and noisy PreparedBMiningState modes."
     )
     parser.add_argument(
         "--m-values",
@@ -49,14 +49,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         type=str,
-        default="disabled,cold,warm,job_transition",
-        help="Comma-separated modes: disabled,cold,warm,job_transition.",
+        default="vanilla,disabled,cold,warm,job_transition",
+        help="Comma-separated modes: vanilla,disabled,cold,warm,job_transition.",
     )
     parser.add_argument("--allow-non-h100", action="store_true")
     args = parser.parse_args()
     args.m_values = _parse_int_list(args.m_values, "--m-values")
     args.modes = [mode.strip() for mode in args.modes.split(",") if mode.strip()]
-    valid_modes = {"disabled", "cold", "warm", "job_transition"}
+    valid_modes = {"vanilla", "disabled", "cold", "warm", "job_transition"}
     unknown_modes = set(args.modes) - valid_modes
     if unknown_modes:
         raise ValueError(f"unknown --modes entries: {sorted(unknown_modes)}")
@@ -94,10 +94,29 @@ def _set_job(sequence: int) -> None:
     get_async_manager()._mining_job = MiningJob(header, 1)
 
 
-def _one_call(a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor) -> None:
+def _one_noisy_call(
+    a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor
+) -> None:
     out = pearl_gemm_noisy(a, b, scale_a, scale_b, torch.bfloat16, submit_block=False)
     # Keep the output live until after kernel launch.
     del out
+
+
+def _one_vanilla_call(
+    a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor
+) -> None:
+    out = pearl_gemm_vanilla(a, b, scale_a, scale_b, torch.bfloat16)
+    # Keep the output live until after kernel launch.
+    del out
+
+
+def _one_call(
+    mode: str, a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor
+) -> None:
+    if mode == "vanilla":
+        _one_vanilla_call(a, b, scale_a, scale_b)
+        return
+    _one_noisy_call(a, b, scale_a, scale_b)
 
 
 def _measure(  # noqa: C901
@@ -110,17 +129,17 @@ def _measure(  # noqa: C901
     scale_b: torch.Tensor,
 ) -> dict[str, float | int | str]:
     clear_prepared_b_cache()
-    if mode == "disabled":
+    if mode in {"vanilla", "disabled"}:
         config.settings.prepared_b_cache_bytes = 0
     else:
         config.settings.prepared_b_cache_bytes = args.cache_bytes
 
     if mode == "warm":
         _set_job(0)
-        _one_call(a, b, scale_a, scale_b)
+        _one_call(mode, a, b, scale_a, scale_b)
         torch.cuda.synchronize()
         reset_prepared_b_cache_stats()
-    elif mode not in {"disabled", "cold", "job_transition"}:
+    elif mode not in {"vanilla", "disabled", "cold", "job_transition"}:
         raise ValueError(f"unknown mode: {mode}")
 
     gpu_samples = []
@@ -130,12 +149,14 @@ def _measure(  # noqa: C901
     for idx in range(args.warmup):
         if mode == "cold":
             clear_prepared_b_cache(reset_stats=False)
-        if mode == "job_transition":
+        if mode == "vanilla":
+            pass
+        elif mode == "job_transition":
             _set_job(sequence)
             sequence += 1
         elif mode != "warm":
             _set_job(idx)
-        _one_call(a, b, scale_a, scale_b)
+        _one_call(mode, a, b, scale_a, scale_b)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
@@ -148,7 +169,7 @@ def _measure(  # noqa: C901
             sequence += 1
         start.record()
         wall_start = time.perf_counter()
-        _one_call(a, b, scale_a, scale_b)
+        _one_call(mode, a, b, scale_a, scale_b)
         end.record()
         torch.cuda.synchronize()
         wall_samples.append((time.perf_counter() - wall_start) * 1000)
