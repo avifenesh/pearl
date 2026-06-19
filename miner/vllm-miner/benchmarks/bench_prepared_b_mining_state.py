@@ -151,10 +151,12 @@ def _measure(  # noqa: C901
             clear_prepared_b_cache(reset_stats=False)
         if mode == "vanilla":
             pass
+        elif mode == "warm":
+            _set_job(0)
         elif mode == "job_transition":
             _set_job(sequence)
             sequence += 1
-        elif mode != "warm":
+        else:
             _set_job(idx)
         _one_call(mode, a, b, scale_a, scale_b)
     torch.cuda.synchronize()
@@ -164,7 +166,9 @@ def _measure(  # noqa: C901
     for _ in range(args.iterations):
         if mode == "cold":
             clear_prepared_b_cache(reset_stats=False)
-        if mode == "job_transition":
+        if mode == "warm":
+            _set_job(0)
+        elif mode == "job_transition":
             _set_job(sequence)
             sequence += 1
         start.record()
