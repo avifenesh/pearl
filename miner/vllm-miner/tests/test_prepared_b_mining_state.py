@@ -1,3 +1,5 @@
+import threading
+
 import torch
 from vllm_miner.prepared_b_mining_state import (
     PreparedBMiningState,
@@ -84,6 +86,50 @@ def test_prepared_b_cache_enforces_byte_budget_with_lru_eviction() -> None:
     assert prepared_b_cache_size() == 1
     assert prepared_b_cache_bytes() <= one_entry_bytes + 1
     assert prepared_b_cache_stats().evictions == 1
+
+
+def test_concurrent_same_key_misses_do_not_double_count_cache_bytes() -> None:
+    weight = torch.empty((4, 4), dtype=torch.int8)
+    barrier = threading.Barrier(2, timeout=5)
+    calls = 0
+    calls_lock = threading.Lock()
+    errors: list[BaseException] = []
+    results: list[PreparedBMiningState] = []
+    one_entry_bytes = _state(1).nbytes
+
+    def prepare() -> PreparedBMiningState:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            fill = calls
+        barrier.wait()
+        return _state(fill)
+
+    def worker() -> None:
+        try:
+            results.append(
+                get_or_prepare_b_mining_state(
+                    weight,
+                    b"job",
+                    128,
+                    100_000,
+                    prepare,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced by assertion below.
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert calls == 2
+    assert len(results) == 2
+    assert prepared_b_cache_size() == 1
+    assert prepared_b_cache_bytes() == one_entry_bytes
 
 
 def test_prepared_b_cache_skips_oversize_and_disabled_entries() -> None:

@@ -4,6 +4,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import RLock
 
 import torch
 
@@ -50,6 +51,7 @@ class PreparedBCacheStats:
 _CACHE: OrderedDict[tuple, _CacheEntry] = OrderedDict()
 _STATS = PreparedBCacheStats()
 _CACHE_BYTES = 0
+_CACHE_LOCK = RLock()
 
 
 def _cache_key(weight: torch.Tensor, job_key_bytes: bytes, noise_rank: int) -> tuple:
@@ -65,7 +67,7 @@ def _cache_key(weight: torch.Tensor, job_key_bytes: bytes, noise_rank: int) -> t
     )
 
 
-def _evict_key(cache_key: tuple) -> None:
+def _evict_key_locked(cache_key: tuple) -> None:
     global _CACHE_BYTES
     entry = _CACHE.pop(cache_key, None)
     if entry is not None:
@@ -73,10 +75,10 @@ def _evict_key(cache_key: tuple) -> None:
         _STATS.evictions += 1
 
 
-def _evict_lru_until_fits(required_bytes: int, max_cache_bytes: int) -> None:
+def _evict_lru_until_fits_locked(required_bytes: int, max_cache_bytes: int) -> None:
     while _CACHE and _CACHE_BYTES + required_bytes > max_cache_bytes:
         cache_key, _ = next(iter(_CACHE.items()))
-        _evict_key(cache_key)
+        _evict_key_locked(cache_key)
 
 
 def get_or_prepare_b_mining_state(
@@ -88,68 +90,85 @@ def get_or_prepare_b_mining_state(
 ) -> PreparedBMiningState:
     """Return immutable B-side mining state for one exact weight/job/rank tuple."""
     if max_cache_bytes <= 0:
-        _STATS.disabled += 1
+        with _CACHE_LOCK:
+            _STATS.disabled += 1
         return prepare()
 
     cache_key = _cache_key(weight, job_key_bytes, noise_rank)
-    entry = _CACHE.get(cache_key)
-    if entry is not None:
-        if entry.weak_weight() is weight:
-            _CACHE.move_to_end(cache_key)
-            _STATS.hits += 1
-            return entry.state
-        _evict_key(cache_key)
+    with _CACHE_LOCK:
+        entry = _CACHE.get(cache_key)
+        if entry is not None:
+            if entry.weak_weight() is weight:
+                _CACHE.move_to_end(cache_key)
+                _STATS.hits += 1
+                return entry.state
+            _evict_key_locked(cache_key)
 
-    _STATS.misses += 1
+        _STATS.misses += 1
     state = prepare()
     state_bytes = state.nbytes
     if state_bytes > max_cache_bytes:
-        _STATS.oversize += 1
+        with _CACHE_LOCK:
+            _STATS.oversize += 1
         return state
 
     def _finalize(ref: weakref.ReferenceType[torch.Tensor], key: tuple = cache_key) -> None:
-        entry = _CACHE.get(key)
-        if entry is not None and entry.weak_weight is ref:
-            _evict_key(key)
+        with _CACHE_LOCK:
+            entry = _CACHE.get(key)
+            if entry is not None and entry.weak_weight is ref:
+                _evict_key_locked(key)
 
     try:
         weak_weight = weakref.ref(weight, _finalize)
     except TypeError:
         return state
 
-    _evict_lru_until_fits(state_bytes, max_cache_bytes)
-    global _CACHE_BYTES
-    _CACHE[cache_key] = _CacheEntry(weak_weight=weak_weight, state=state)
-    _CACHE_BYTES += state_bytes
+    with _CACHE_LOCK:
+        entry = _CACHE.get(cache_key)
+        if entry is not None:
+            if entry.weak_weight() is weight:
+                _CACHE.move_to_end(cache_key)
+                return entry.state
+            _evict_key_locked(cache_key)
+
+        _evict_lru_until_fits_locked(state_bytes, max_cache_bytes)
+        global _CACHE_BYTES
+        _CACHE[cache_key] = _CacheEntry(weak_weight=weak_weight, state=state)
+        _CACHE_BYTES += state_bytes
     return state
 
 
 def clear_prepared_b_cache(*, reset_stats: bool = True) -> None:
     global _CACHE_BYTES, _STATS
-    _CACHE.clear()
-    _CACHE_BYTES = 0
-    if reset_stats:
-        _STATS = PreparedBCacheStats()
+    with _CACHE_LOCK:
+        _CACHE.clear()
+        _CACHE_BYTES = 0
+        if reset_stats:
+            _STATS = PreparedBCacheStats()
 
 
 def reset_prepared_b_cache_stats() -> None:
     global _STATS
-    _STATS = PreparedBCacheStats()
+    with _CACHE_LOCK:
+        _STATS = PreparedBCacheStats()
 
 
 def prepared_b_cache_stats() -> PreparedBCacheStats:
-    return PreparedBCacheStats(
-        hits=_STATS.hits,
-        misses=_STATS.misses,
-        evictions=_STATS.evictions,
-        oversize=_STATS.oversize,
-        disabled=_STATS.disabled,
-    )
+    with _CACHE_LOCK:
+        return PreparedBCacheStats(
+            hits=_STATS.hits,
+            misses=_STATS.misses,
+            evictions=_STATS.evictions,
+            oversize=_STATS.oversize,
+            disabled=_STATS.disabled,
+        )
 
 
 def prepared_b_cache_size() -> int:
-    return len(_CACHE)
+    with _CACHE_LOCK:
+        return len(_CACHE)
 
 
 def prepared_b_cache_bytes() -> int:
-    return _CACHE_BYTES
+    with _CACHE_LOCK:
+        return _CACHE_BYTES
